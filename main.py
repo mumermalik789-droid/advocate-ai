@@ -1,5 +1,5 @@
 """Pakistani Legal AI - REST backend (FastAPI). Secrets sirf environment variables mein."""
-import hashlib, hmac, json, os, re, secrets, smtplib, ssl, time
+import hashlib, hmac, json, os, re, secrets, smtplib, ssl, time, urllib.error, urllib.request
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from io import BytesIO
@@ -18,7 +18,11 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")      # code mein kabhi na 
 SMTP_HOST, SMTP_PORT = "smtp.gmail.com", 587
 SMTP_USER, SMTP_PASS = os.environ.get("SMTP_USER", ""), os.environ.get("SMTP_PASS", "")
 DEV_SHOW_OTP = os.environ.get("DEV_SHOW_OTP") == "1"
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")          # HTTP email (free plan par bhi chalta hai)
+MAIL_FROM = os.environ.get("MAIL_FROM", SMTP_USER)            # Brevo mein verify kiya hua sender email
+EMAIL_CONFIGURED = bool(BREVO_API_KEY or (SMTP_USER and SMTP_PASS))
 ADMIN_NAME = "Muhammad Umer"
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 DATA = os.environ.get("DATA_DIR", "data")
 os.makedirs(DATA, exist_ok=True)
@@ -31,6 +35,10 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 app = FastAPI(title="Advocate AI API")
 # Chrome (Flutter web) mein test ke liye. Asli server par allow_origins mein apni website likhein.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/")
+def root():
+    return {"status": "ok", "app": "Advocate AI API"}
 
 # ---------------------------------------------------------------- helpers
 def rj(path, default):
@@ -115,6 +123,20 @@ def current(authorization, allow_expired=False):
 
 # ---------------------------------------------------------------- email OTP
 def send_email(to, subject, body):
+    if BREVO_API_KEY:
+        if not MAIL_FROM: return False, "MAIL_FROM set nahi hai."
+        payload = {"sender": {"name": "Advocate AI", "email": MAIL_FROM}, "to": [{"email": to}],
+                   "subject": subject, "textContent": body}
+        req = urllib.request.Request("https://api.brevo.com/v3/smtp/email", data=json.dumps(payload).encode(),
+                                     headers={"api-key": BREVO_API_KEY, "content-type": "application/json",
+                                              "accept": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=20):
+                return True, ""
+        except urllib.error.HTTPError as e:
+            return False, f"Email send nahi ho saka (Brevo {e.code}): {e.read().decode('utf-8', 'ignore')[:150]}"
+        except Exception as e:
+            return False, f"Email send nahi ho saka: {e}"
     if not (SMTP_USER and SMTP_PASS): return False, "Email service configure nahi hai."
     m = EmailMessage(); m["From"], m["To"], m["Subject"] = SMTP_USER, to, subject; m.set_content(body)
     try:
@@ -135,7 +157,7 @@ def otp_send(purpose, email, payload=None):
                          f"Aapka verification code: {code}\nYe {OTP_VALID // 60} minute tak valid hai.")
     note = ""
     if not ok:
-        if DEV_SHOW_OTP and not (SMTP_USER and SMTP_PASS): note = f"TEST MODE - code: {code}"
+        if DEV_SHOW_OTP and not EMAIL_CONFIGURED: note = f"TEST MODE - code: {code}"
         else: return False, err
     pend[key] = {"code": _h(code), "expires": now + OTP_VALID, "attempts": 0, "sent_at": now, "payload": payload or {}}
     wj(PENDING_FILE, pend)
@@ -187,7 +209,7 @@ def verify(r: Verify):
     if find_account(users, email): raise HTTPException(400, "Account pehle se ban chuka hai.")
     users[email] = {"chamber_name": d["chamber"], "email": email, "email_canon": canonical_email(email),
                     "email_verified": True, "password": d["pw_hash"], "package": d["pkg"], "prompt_count": 0,
-                    "last_reset_date": str(date.today()), "expiry_date": str(date.today() + timedelta(days=3)),
+                    "last_reset_date": str(date.today()), "created": str(date.today()), "expiry_date": str(date.today() + timedelta(days=3)),
                     "is_admin": False, "sessions": {}}
     return {"token": new_session(users, email), "user": profile(users[email])}
 
@@ -255,7 +277,8 @@ class AiReq(BaseModel):
     kind: str                      # draft | research | citation | fir
     language: str = "English"
     fields: dict = {}
-    image_b64: str | None = None   # JPEG
+    image_b64: str | None = None   # purana (ek tasveer)
+    images_b64: list[str] | None = None   # nayi: kai tasveerein (JPEG)
 
 def build_prompt(r: AiReq):
     f, L = r.fields, lang_instr(r.language); blank = "(not provided - leave a clear blank placeholder)"
@@ -286,7 +309,7 @@ Cover: 1) what you can confirm about parties/year/reporter, 2) parallel citation
 3) whether it is still good law or overruled, 4) ratio decidendi.
 Be explicit about anything you cannot confirm; do NOT invent details.""", "Citation Check"
     if r.kind == "fir":
-        if not (g("text") or r.image_b64): raise HTTPException(400, "FIR text ya photo dein.")
+        if not (g("text") or r.image_b64 or r.images_b64): raise HTTPException(400, "FIR text ya photo dein.")
         return f"""{L}
 Summarize and analyze this FIR for a Pakistani advocate: allegations, sections applied,
 weak points, bail grounds and next steps.
@@ -302,14 +325,16 @@ def ai(r: AiReq, authorization: str = Header(None)):
         raise HTTPException(429, f"Aaj ki limit ({lim} prompts) mukammal. Kal reset hogi ya package upgrade karein.")
     if not API_KEY: raise HTTPException(500, "AI service configure nahi hai.")
     prompt, label = build_prompt(r)
+    imgs = [i for i in (list(r.images_b64 or []) + ([r.image_b64] if r.image_b64 else [])) if i]
+    if len(imgs) > 5: raise HTTPException(400, "Ek waqt mein ziyada se ziyada 5 tasveerein dein.")
+    if any(len(i) > 2_000_000 for i in imgs): raise HTTPException(400, "Koi tasveer bohat bari hai.")
     content = prompt
-    if r.image_b64:
-        if len(r.image_b64) > 2_000_000: raise HTTPException(400, "Image bohat bari hai.")
-        content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": r.image_b64}},
-                   {"type": "text", "text": prompt}]
+    if imgs:
+        content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": i}} for i in imgs]
+        content.append({"type": "text", "text": prompt})
     try:
         res = anthropic.Anthropic(api_key=API_KEY).messages.create(
-            model="claude-sonnet-4-6", max_tokens=3500, system=SYSTEM, messages=[{"role": "user", "content": content}])
+            model=MODEL, max_tokens=3500, system=SYSTEM, messages=[{"role": "user", "content": content}])
     except Exception as e:
         raise HTTPException(502, f"AI se jawab nahi aa saka: {e}")
     text = res.content[0].text
@@ -349,7 +374,8 @@ def export_docx(r: Export, authorization: str = Header(None)):
 def admin_users(authorization: str = Header(None)):
     users, uid = current(authorization)
     if not users[uid].get("is_admin"): raise HTTPException(403)
-    return [{"id": k, **profile(v), "devices": len(v.get("sessions", {}))} for k, v in users.items() if k != "admin"]
+    return [{"id": k, **profile(v), "devices": len(v.get("sessions", {})), "email_verified": bool(v.get("email_verified")),
+             "created": v.get("created", "")} for k, v in users.items() if k != "admin"]
 
 class AdminSet(BaseModel): id: str; package: str | None = None; expiry_date: str | None = None; add_days: int = 0
 
@@ -365,3 +391,24 @@ def admin_update(r: AdminSet, authorization: str = Header(None)):
         base = max(datetime.strptime(v["expiry_date"], "%Y-%m-%d").date(), date.today())
         v["expiry_date"] = str(base + timedelta(days=r.add_days))
     wj(USERS_FILE, users); return {"ok": True}
+
+
+class AdminId(BaseModel): id: str
+
+@app.post("/admin/logout_all")
+def admin_logout_all(r: AdminId, authorization: str = Header(None)):
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403)
+    if r.id not in users: raise HTTPException(404)
+    users[r.id]["sessions"] = {}; wj(USERS_FILE, users); return {"ok": True}
+
+@app.post("/admin/delete")
+def admin_delete(r: AdminId, authorization: str = Header(None)):
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403)
+    if r.id == "admin" or r.id not in users: raise HTTPException(400, "Ye account delete nahi ho sakta.")
+    del users[r.id]; wj(USERS_FILE, users)
+    for col in COLS:
+        try: os.remove(dpath(r.id, col))
+        except OSError: pass
+    return {"ok": True}
