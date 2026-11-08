@@ -27,6 +27,7 @@ MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 DATA = os.environ.get("DATA_DIR", "data")
 os.makedirs(DATA, exist_ok=True)
 USERS_FILE, PENDING_FILE = f"{DATA}/users.json", f"{DATA}/pending.json"
+CAT_CACHE = f"{DATA}/category_cache.json"
 OTP_VALID, RESEND, SESSION_DAYS = 600, 60, 30
 DAILY_LIMITS = {"basic": 15, "standard": 25, "premium": None}
 MAX_DEVICES = {"basic": 2, "standard": 2, "premium": 3}
@@ -287,6 +288,28 @@ def lang_instr(l):
     return ("IMPORTANT: Write the ENTIRE output strictly in formal Standard Legal English as used in Pakistani courts: pleading style "
             "('It is respectfully submitted that...', numbered paragraphs beginning 'That ...', 'GROUNDS', 'PRAYER', 'VERIFICATION').")
 
+CATEGORIES = {
+    "qatal": "Murder and homicide (qatl-i-amd, qatl-i-shibh-i-amd, qatl-i-khata, qatl-bis-sabab, attempt to murder, abetment and related provisions)",
+    "larai": "Fights, hurt and assault (every category of hurt, shajjah, itlaf-i-udw, grievous hurt, assault, hurt by weapons)",
+    "fasad": "Rioting, unlawful assembly and affray",
+    "chori": "Theft, house-trespass, house-breaking and receiving stolen property",
+    "dakaiti": "Robbery, dacoity and extortion",
+    "fraud": "Cheating, forgery, criminal breach of trust, misappropriation and fraud",
+    "cheque": "Dishonour of cheques and related negotiable-instrument offences",
+    "aghwa": "Kidnapping, abduction, wrongful confinement and trafficking",
+    "zina": "Zina, rape and other sexual offences",
+    "dhamki": "Criminal intimidation, threats, blackmail and harassment",
+    "qabza": "Illegal possession, trespass, mischief and land-grabbing (criminal, civil and revenue provisions)",
+    "narcotics": "Narcotics offences under the Control of Narcotic Substances Act 1997",
+    "cyber": "Cyber crimes under the Prevention of Electronic Crimes Act 2016 and related provisions",
+    "arms": "Arms and explosives offences",
+    "tohmat": "Defamation, insult and offences against honour",
+    "hadsa": "Rash and negligent driving, negligence causing death or hurt",
+    "jhoot": "False evidence, false case or FIR, perjury and offences against public justice",
+    "daheshat": "Terrorism offences under the Anti-Terrorism Act 1997",
+    "ghareloo": "Domestic and family offences (dowry, domestic violence, cruelty, marriage-related offences)",
+}
+
 def lang_plain(l):
     if l.startswith("Urdu"): return "IMPORTANT: Write the answer in clear, professional legal Urdu (Urdu script); keep section numbers, statute names and case citations in English. Do not use pleading format."
     if l.startswith("Roman"): return "IMPORTANT: Write the answer in clear, professional Roman Urdu (Urdu in English script); keep statute names and citations in English."
@@ -341,6 +364,14 @@ Summarize and analyze this FIR for a Pakistani advocate: allegations, sections a
 weak points, bail grounds and next steps. Use a formal professional tone. End with one final line starting with 'Recommended draft:' naming the single most suitable petition or application to file now (for example pre-arrest bail, post-arrest bail, quashing of FIR).
 FIR TEXT:
 {g('text')}""", "FIR Analysis"
+    if r.kind == "category":
+        cid = g("category")
+        if cid not in CATEGORIES: raise HTTPException(400, "Ghalat category.")
+        return f"""{LP}
+Topic: {CATEGORIES[cid]}
+List the sections of Pakistani law that are commonly applied in cases of this kind, so that an advocate can see at a glance which sections apply. Group them as: A) Pakistan Penal Code sections, B) special-law sections (if any), C) Code of Criminal Procedure (or other procedural) sections commonly used in such cases (for example FIR, arrest, bail, quashing), D) sections that are commonly added together (such as 34, 109, 148/149, 120-B) when relevant.
+For every section give one compact block in this form, without tables or markdown: 'Section <number> <Act> - <name of offence>: punishment; bailable or non-bailable; cognizable or non-cognizable; compoundable or not; court of trial'. Keep each block to one or two lines and order the sections logically (most serious first).
+Be accurate. If you are not sure about a detail (for example a punishment after an amendment) write 'verify' instead of guessing, and never invent section numbers. Finish with one line reminding the advocate to verify the current text on the official Pakistan Code website.""", f"Dafaat - {cid}"
     if r.kind == "section":
         law = g("law") or "all relevant Pakistani laws"
         if g("mode") == "topic":
@@ -362,6 +393,11 @@ Statutes are amended often, so state clearly that the advocate must verify the c
 def ai(r: AiReq, authorization: str = Header(None)):
     users, uid = current(authorization); u = users[uid]
     lim = DAILY_LIMITS.get(u.get("package"))
+    ckey = f"{(r.fields or {}).get('category', '')}|{r.language}"
+    if r.kind == "category":      # ek hi list sab ke liye: cache mein ho to free aur foran
+        hit = rj(CAT_CACHE, {}).get(ckey)
+        if hit and time.time() - hit.get("ts", 0) < 30 * 86400:
+            return {"result": hit["text"], "type": f"Dafaat - {ckey.split('|')[0]}", "used": u.get("prompt_count", 0), "limit": lim, "cached": True}
     if not u.get("is_admin") and lim is not None and u.get("prompt_count", 0) >= lim:
         raise HTTPException(429, f"Aaj ki limit ({lim} prompts) mukammal. Kal reset hogi ya package upgrade karein.")
     if not API_KEY: raise HTTPException(500, "AI service configure nahi hai.")
@@ -389,6 +425,8 @@ def ai(r: AiReq, authorization: str = Header(None)):
     except Exception as e:
         raise HTTPException(502, f"AI se jawab nahi aa saka: {e}")
     text = res.content[0].text
+    if r.kind == "category":
+        cache = rj(CAT_CACHE, {}); cache[ckey] = {"text": text, "ts": time.time()}; wj(CAT_CACHE, cache)
     u["prompt_count"] = u.get("prompt_count", 0) + 1; wj(USERS_FILE, users)
     hist = rj(dpath(uid, "history"), [])
     hist.append({"time": datetime.now().strftime("%d-%m-%Y %H:%M"), "type": label, "result": text, "lang": r.language})
