@@ -22,7 +22,7 @@ BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")          # HTTP email (free 
 MAIL_FROM = os.environ.get("MAIL_FROM", SMTP_USER)            # Brevo mein verify kiya hua sender email
 EMAIL_CONFIGURED = bool(BREVO_API_KEY or (SMTP_USER and SMTP_PASS))
 ADMIN_NAME = "Muhammad Umer"
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 
 DATA = os.environ.get("DATA_DIR", "data")
 os.makedirs(DATA, exist_ok=True)
@@ -262,16 +262,40 @@ def put_col(col: str, rows: list[dict], authorization: str = Header(None)):
     wj(dpath(uid, col), rows[:5000]); return {"ok": True}
 
 # ---------------------------------------------------------------- AI
-SYSTEM = ("You are an expert Senior Advocate and Legal Drafter practicing in the High Courts and Supreme Court "
-          "of Pakistan. You excel at Pakistani law (Constitution, CPC, PPC, CrPC, QSO, Revenue Laws), precedents, "
-          "and drafting formal legal documents. If you are not certain a citation is real, say so clearly instead of inventing one.")
+SYSTEM = ("You are a Senior Advocate of the High Court and Supreme Court of Pakistan with 30 years of drafting experience. "
+          "You excel at Pakistani law (Constitution, CPC, PPC, CrPC, QSO, Family, Revenue and special laws) and precedents. "
+          "When asked to draft, produce ONLY the finished court-ready document: proper heading and title of the case, parties, "
+          "numbered paragraphs, grounds, prayer, verification/affidavit and signature block where applicable. Use a formal, "
+          "precise, professional pleading register at all times, never a chatty or simplified tone. Do not add introductions, "
+          "notes or explanations outside the document and do not use markdown symbols (#, *, tables). Put unknown facts in "
+          "square-bracket blanks such as [____]. If you are not certain a citation is real, say so clearly instead of inventing one.")
+
+URDU_STYLE = (
+    "IMPORTANT: Write the ENTIRE document in formal, professional Pakistani court Urdu, exactly as a senior advocate drafts "
+    "pleadings for the High Court and District Courts. Use Urdu script only (no Roman Urdu); English only for unavoidable names, "
+    "section numbers and citations. Use the authentic pleading register and structure: court heading 'بعدالت جناب ...', case title "
+    "block with 'درخواست گزار/سائل ... بنام ... مسئول علیہ/مدعا علیہ' (or 'مستغیث', 'ملزم', 'استغاثہ' as the case requires), a "
+    "subject line 'عنوان: ...', an opening 'مؤدبانہ گزارش ہے کہ', numbered paragraphs each beginning 'یہ کہ', grounds as numbered "
+    "'بنیادِ درخواست', the prayer introduced by 'لہٰذا استدعا ہے کہ ...', then 'مورخہ', 'العارض / درخواست گزار' with 'بذریعہ ایڈووکیٹ' "
+    "signature block, and 'حلف نامہ' / 'تصدیق' in the standard form ('میں ... بحلف بیان کرتا/کرتی ہوں کہ ...') wherever applicable. "
+    "Cite law in standard Urdu court form (for example 'زیر دفعہ 497 مجموعہ ضابطہ فوجداری 1898', 'مجموعہ تعزیراتِ پاکستان', 'ایف آئی آر', "
+    "'تھانہ'). Avoid colloquial, Hindi-origin or casual words; use complete, dignified, grammatically correct legal sentences.")
 
 def lang_instr(l):
-    if l.startswith("Urdu"):
-        return ("IMPORTANT: Write the ENTIRE output strictly in High Court & District Court standard Pakistani legal "
-                "Urdu (بعدالت جناب, سائل/درخواست گزار, مسئول عنہ, عرض ہے کہ, استدعا ہے کہ, حلف نامہ).")
-    if l.startswith("Roman"): return "IMPORTANT: Write the ENTIRE output strictly in Roman Urdu (Urdu in English script)."
-    return "IMPORTANT: Write the ENTIRE output strictly in Standard Legal English as used in Pakistani courts."
+    if l.startswith("Urdu"): return URDU_STYLE
+    if l.startswith("Roman"): return "IMPORTANT: Write the ENTIRE output strictly in formal, professional Roman Urdu (Urdu in English script), keeping the structure of a Pakistani court pleading."
+    return ("IMPORTANT: Write the ENTIRE output strictly in formal Standard Legal English as used in Pakistani courts: pleading style "
+            "('It is respectfully submitted that...', numbered paragraphs beginning 'That ...', 'GROUNDS', 'PRAYER', 'VERIFICATION').")
+
+def lang_plain(l):
+    if l.startswith("Urdu"): return "IMPORTANT: Write the answer in clear, professional legal Urdu (Urdu script); keep section numbers, statute names and case citations in English. Do not use pleading format."
+    if l.startswith("Roman"): return "IMPORTANT: Write the answer in clear, professional Roman Urdu (Urdu in English script); keep statute names and citations in English."
+    return "IMPORTANT: Write the answer in clear, professional Standard Legal English as used by Pakistani advocates."
+
+TEMPLATE_INSTR = ("IMPORTANT: The advocate's own sample draft is attached as TEMPLATE images. Reproduce its layout exactly: the same "
+                  "heading and title block, order of sections, numbering style, opening and closing formulas, prayer and verification wording, "
+                  "and the same language, script and legal register as the template. Replace ONLY the case-specific details with the facts "
+                  "given below and do not copy the template's own names, dates or numbers.")
 
 class AiReq(BaseModel):
     kind: str                      # draft | research | citation | fir
@@ -279,9 +303,10 @@ class AiReq(BaseModel):
     fields: dict = {}
     image_b64: str | None = None   # purana (ek tasveer)
     images_b64: list[str] | None = None   # nayi: kai tasveerein (JPEG)
+    template_id: str | None = None        # saved template (server par)
 
-def build_prompt(r: AiReq):
-    f, L = r.fields, lang_instr(r.language); blank = "(not provided - leave a clear blank placeholder)"
+def build_prompt(r: AiReq, has_template=False):
+    f, L = r.fields, (TEMPLATE_INSTR if has_template else lang_instr(r.language)); blank = "(not provided - leave a clear blank placeholder)"; LP = lang_plain(r.language)
     g = lambda k: (f.get(k) or "").strip()
     if r.kind == "draft":
         if not g("facts"): raise HTTPException(400, "Pehle facts likhein.")
@@ -292,10 +317,11 @@ Prepare a complete, court-ready {g('category')} document: {g('doc_type')}
 - Parties: {g('parties') or blank}
 - Reference (FIR/Law): {g('ref') or blank}
 - Other details: {g('extra') or blank}
-- Facts & Grounds: {g('facts')}""", f"Draft - {g('doc_type')}"
+- Facts & Grounds: {g('facts')}
+Output only the finished document (no preface, notes or markdown symbols).""", f"Draft - {g('doc_type')}"
     if r.kind == "research":
         if not (g("section") or g("question")): raise HTTPException(400, "Section ya sawal likhein.")
-        return f"""{L}
+        return f"""{LP}
 Conduct legal research on Pakistani law: {g('act')}
 - Provision: {g('section')}
 - Precedents from: {g('court')}
@@ -303,18 +329,33 @@ Conduct legal research on Pakistani law: {g('act')}
 Give the bare-act position, key principles and leading case law. Mark any citation you are unsure of.""", f"Research - {g('act')}"
     if r.kind == "citation":
         if not g("citation"): raise HTTPException(400, "Citation likhein.")
-        return f"""{L}
+        return f"""{LP}
 Review this Pakistani citation: {g('citation')} ({g('court')}). Topic: {g('topic')}
 Cover: 1) what you can confirm about parties/year/reporter, 2) parallel citations,
 3) whether it is still good law or overruled, 4) ratio decidendi.
 Be explicit about anything you cannot confirm; do NOT invent details.""", "Citation Check"
     if r.kind == "fir":
         if not (g("text") or r.image_b64 or r.images_b64): raise HTTPException(400, "FIR text ya photo dein.")
-        return f"""{L}
+        return f"""{LP}
 Summarize and analyze this FIR for a Pakistani advocate: allegations, sections applied,
-weak points, bail grounds and next steps.
+weak points, bail grounds and next steps. Use a formal professional tone. End with one final line starting with 'Recommended draft:' naming the single most suitable petition or application to file now (for example pre-arrest bail, post-arrest bail, quashing of FIR).
 FIR TEXT:
 {g('text')}""", "FIR Analysis"
+    if r.kind == "section":
+        law = g("law") or "all relevant Pakistani laws"
+        if g("mode") == "topic":
+            if not g("topic"): raise HTTPException(400, "Jurm ya masla likhein.")
+            return f"""{LP}
+An advocate describes this offence or legal issue: {g('topic')}
+Search within: {law}
+Identify the most relevant sections or provisions of Pakistani law that apply: for each give the Act, the section number and a one-line explanation, ranked by relevance. For offences also state the punishment, whether it is bailable or non-bailable, cognizable or non-cognizable, compoundable, and the court of trial. Mention alternative or companion sections that are often invoked together, then add brief practical notes for the advocate.
+Be explicit about anything you are not certain of and never invent section numbers.""", "Dafa search"
+        if not g("section"): raise HTTPException(400, "Dafa / section number likhein.")
+        q = ("Specific question: " + g("question")) if g("question") else ""
+        return f"""{LP}
+Explain this provision of Pakistani law for an advocate. Law: {law}. Provision: {g('section')}. {q}
+Use these headings: 1) Name of the law and the section title; 2) Text or substance of the provision (if you cannot recall the exact wording, give the substance and say so); 3) Essential ingredients; 4) Punishment or relief, and for offences whether bailable or non-bailable, cognizable or non-cognizable, compoundable, and the court of trial; 5) Important amendments you know of; 6) Related and alternative sections; 7) Leading case law (mark any citation you are not sure of); 8) Practical points for bail, quashing or defence.
+Statutes are amended often, so state clearly that the advocate must verify the current text on the official Pakistan Code website before relying on it. Never invent section numbers, text or citations.""", (f"Dafa - {g('section')} {g('law')}")[:80]
     raise HTTPException(400, "Unknown kind")
 
 @app.post("/ai")
@@ -324,17 +365,27 @@ def ai(r: AiReq, authorization: str = Header(None)):
     if not u.get("is_admin") and lim is not None and u.get("prompt_count", 0) >= lim:
         raise HTTPException(429, f"Aaj ki limit ({lim} prompts) mukammal. Kal reset hogi ya package upgrade karein.")
     if not API_KEY: raise HTTPException(500, "AI service configure nahi hai.")
-    prompt, label = build_prompt(r)
+    tmpl = []
+    if r.template_id:
+        for t in rj(dpath(uid, "templates"), []):
+            if t.get("id") == r.template_id: tmpl = t.get("images", [])
+        if not tmpl: raise HTTPException(404, "Ye template nahi mila.")
+    prompt, label = build_prompt(r, bool(tmpl))
     imgs = [i for i in (list(r.images_b64 or []) + ([r.image_b64] if r.image_b64 else [])) if i]
     if len(imgs) > 5: raise HTTPException(400, "Ek waqt mein ziyada se ziyada 5 tasveerein dein.")
     if any(len(i) > 2_000_000 for i in imgs): raise HTTPException(400, "Koi tasveer bohat bari hai.")
-    content = prompt
+    img_block = lambda i: {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": i}}
+    blocks = []
+    if tmpl:
+        blocks.append({"type": "text", "text": "TEMPLATE (advocate's own sample draft - copy its layout and language):"})
+        blocks += [img_block(i) for i in tmpl]
     if imgs:
-        content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": i}} for i in imgs]
-        content.append({"type": "text", "text": prompt})
+        blocks.append({"type": "text", "text": "CASE DOCUMENTS (FIR / order photos - use for facts only):"})
+        blocks += [img_block(i) for i in imgs]
+    content = (blocks + [{"type": "text", "text": prompt}]) if blocks else prompt
     try:
         res = anthropic.Anthropic(api_key=API_KEY).messages.create(
-            model=MODEL, max_tokens=3500, system=SYSTEM, messages=[{"role": "user", "content": content}])
+            model=MODEL, max_tokens=6000, system=SYSTEM, messages=[{"role": "user", "content": content}])
     except Exception as e:
         raise HTTPException(502, f"AI se jawab nahi aa saka: {e}")
     text = res.content[0].text
@@ -343,6 +394,32 @@ def ai(r: AiReq, authorization: str = Header(None)):
     hist.append({"time": datetime.now().strftime("%d-%m-%Y %H:%M"), "type": label, "result": text, "lang": r.language})
     wj(dpath(uid, "history"), hist[-300:])
     return {"result": text, "type": label, "used": u["prompt_count"], "limit": lim}
+
+# ---------------------------------------------------------------- templates (advocate ke apne draft ki photos)
+class TemplateIn(BaseModel): name: str; images_b64: list[str]
+
+@app.get("/templates")
+def list_templates(authorization: str = Header(None)):
+    _, uid = current(authorization)
+    return [{"id": t["id"], "name": t["name"], "pages": len(t["images"])} for t in rj(dpath(uid, "templates"), [])]
+
+@app.post("/templates")
+def add_template(r: TemplateIn, authorization: str = Header(None)):
+    _, uid = current(authorization)
+    if not r.name.strip(): raise HTTPException(400, "Template ka naam likhein.")
+    if not (1 <= len(r.images_b64) <= 3): raise HTTPException(400, "Template ki 1 se 3 tasveerein (pages) dein.")
+    if any(len(i) > 2_000_000 for i in r.images_b64): raise HTTPException(400, "Koi tasveer bohat bari hai.")
+    lst = rj(dpath(uid, "templates"), [])
+    if len(lst) >= 10: raise HTTPException(400, "Ziyada se ziyada 10 templates save ho sakte hain. Purana delete karein.")
+    t = {"id": secrets.token_hex(4), "name": r.name.strip()[:60], "images": r.images_b64}
+    lst.append(t); wj(dpath(uid, "templates"), lst)
+    return {"id": t["id"]}
+
+@app.delete("/templates/{tid}")
+def delete_template(tid: str, authorization: str = Header(None)):
+    _, uid = current(authorization)
+    wj(dpath(uid, "templates"), [t for t in rj(dpath(uid, "templates"), []) if t.get("id") != tid])
+    return {"ok": True}
 
 # ---------------------------------------------------------------- DOCX export
 class Export(BaseModel): text: str; urdu: bool = False
@@ -408,7 +485,7 @@ def admin_delete(r: AdminId, authorization: str = Header(None)):
     if not users[uid].get("is_admin"): raise HTTPException(403)
     if r.id == "admin" or r.id not in users: raise HTTPException(400, "Ye account delete nahi ho sakta.")
     del users[r.id]; wj(USERS_FILE, users)
-    for col in COLS:
+    for col in list(COLS) + ["templates"]:
         try: os.remove(dpath(r.id, col))
         except OSError: pass
     return {"ok": True}
