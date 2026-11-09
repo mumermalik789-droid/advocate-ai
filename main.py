@@ -28,7 +28,7 @@ DATA = os.environ.get("DATA_DIR", "data")
 os.makedirs(DATA, exist_ok=True)
 USERS_FILE, PENDING_FILE = f"{DATA}/users.json", f"{DATA}/pending.json"
 CAT_CACHE = f"{DATA}/category_cache.json"
-OTP_VALID, RESEND, SESSION_DAYS = 600, 60, 30
+OTP_VALID, RESEND, SESSION_DAYS = 600, 60, 90      # har istemal par session barhta rehta hai
 DAILY_LIMITS = {"basic": 15, "standard": 25, "premium": None}
 MAX_DEVICES = {"basic": 2, "standard": 2, "premium": 3}
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -44,7 +44,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v17-async", "model": MODEL}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v18", "model": MODEL, "data_dir": DATA}
 
 # ---------------------------------------------------------------- helpers
 def rj(path, default):
@@ -54,9 +54,14 @@ def rj(path, default):
     except Exception:
         return default
 
+_WLOCK = threading.Lock()
 def wj(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """Pehle temp file mein likh kar badalta hai, taake crash par users.json kharab/khali na ho."""
+    with _WLOCK:
+        tmp = f"{path}.{secrets.token_hex(3)}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
 
 def _h(t): return hashlib.sha256(t.encode()).hexdigest()
 
@@ -110,7 +115,7 @@ def profile(u):
     lim = DAILY_LIMITS.get(u.get("package"))
     return {"chamber_name": u["chamber_name"], "email": u.get("email", ""), "package": u.get("package"),
             "expiry_date": u.get("expiry_date"), "used": u.get("prompt_count", 0), "limit": lim,
-            "is_admin": bool(u.get("is_admin"))}
+            "is_admin": bool(u.get("is_admin")), "disabled": bool(u.get("disabled"))}
 
 # ---------------------------------------------------------------- auth dependency
 def current(authorization, allow_expired=False):
@@ -120,8 +125,14 @@ def current(authorization, allow_expired=False):
     for uid, u in users.items():
         ts = u.get("sessions", {}).get(h)
         if ts and time.time() - ts <= SESSION_DAYS * 86400:
+            if u.get("disabled") and not u.get("is_admin"):
+                raise HTTPException(403, "Aapka account admin ne band kar diya hai. Admin se rabta karein.")
+            dirty = False
+            if time.time() - ts > 86400:                  # roz ek dafa meaad barha do: active user kabhi logout nahi hoga
+                u["sessions"][h] = time.time(); dirty = True
             if u.get("last_reset_date") != str(date.today()):
-                u["prompt_count"], u["last_reset_date"] = 0, str(date.today()); wj(USERS_FILE, users)
+                u["prompt_count"], u["last_reset_date"] = 0, str(date.today()); dirty = True
+            if dirty: wj(USERS_FILE, users)
             if not allow_expired and not u.get("is_admin") and str(date.today()) > u.get("expiry_date", "0"):
                 raise HTTPException(402, "Subscription expire ho gayi hai")
             return users, uid
@@ -180,7 +191,7 @@ def otp_check(purpose, email, code):
 
 # ---------------------------------------------------------------- auth routes
 class Login(BaseModel): identifier: str; password: str
-class Signup(BaseModel): chamber: str; email: str; password: str; package: str = "basic"
+class Signup(BaseModel): chamber: str; email: str; password: str; package: str = "basic"; name: str = ""; phone: str = ""; city: str = ""; bar_no: str = ""
 class Verify(BaseModel): email: str; code: str
 class Forgot(BaseModel): email: str
 class Reset(BaseModel): email: str; code: str; new_password: str
@@ -193,6 +204,7 @@ def login(r: Login):
     ok = (bool(ADMIN_PASSWORD) and hmac.compare_digest(r.password, ADMIN_PASSWORD)) if u.get("is_admin") \
         else check_password(r.password, u.get("password", ""))
     if not ok: raise HTTPException(401, "Email ya password ghalat hai.")
+    if u.get("disabled") and not u.get("is_admin"): raise HTTPException(403, "Aapka account admin ne band kar diya hai. Admin se rabta karein.")
     if not u.get("is_admin") and "$" not in u["password"]: u["password"] = hash_password(r.password)
     return {"token": new_session(users, uid), "user": profile(u)}
 
@@ -202,8 +214,13 @@ def signup(r: Signup):
     if not (r.chamber.strip() and EMAIL_RE.match(email)): raise HTTPException(400, "Naam aur sahi email likhein.")
     if len(r.password) < 8: raise HTTPException(400, "Password kam az kam 8 characters ka ho.")
     if r.package not in DAILY_LIMITS: raise HTTPException(400, "Ghalat package.")
+    if not r.name.strip(): raise HTTPException(400, "Apna poora naam likhein.")
+    phone = re.sub(r"[^0-9+]", "", r.phone)
+    if len(re.sub(r"\D", "", phone)) < 10: raise HTTPException(400, "Sahi mobile / WhatsApp number likhein.")
+    if not r.city.strip(): raise HTTPException(400, "Shehr ka naam likhein.")
     if find_account(users, email): raise HTTPException(400, "Is email se account pehle se hai.")
-    ok, info = otp_send("signup", email, {"chamber": r.chamber.strip(), "pw_hash": hash_password(r.password), "pkg": r.package})
+    ok, info = otp_send("signup", email, {"chamber": r.chamber.strip(), "pw_hash": hash_password(r.password), "pkg": r.package,
+                                          "name": r.name.strip()[:80], "phone": phone[:20], "city": r.city.strip()[:40], "bar_no": r.bar_no.strip()[:40]})
     if not ok: raise HTTPException(400, info)
     return {"ok": True, "note": info}
 
@@ -215,6 +232,7 @@ def verify(r: Verify):
     if find_account(users, email): raise HTTPException(400, "Account pehle se ban chuka hai.")
     users[email] = {"chamber_name": d["chamber"], "email": email, "email_canon": canonical_email(email),
                     "email_verified": True, "password": d["pw_hash"], "package": d["pkg"], "prompt_count": 0,
+                    "name": d.get("name", ""), "phone": d.get("phone", ""), "city": d.get("city", ""), "bar_no": d.get("bar_no", ""),
                     "last_reset_date": str(date.today()), "created": str(date.today()), "expiry_date": str(date.today() + timedelta(days=3)),
                     "is_admin": False, "sessions": {}}
     return {"token": new_session(users, email), "user": profile(users[email])}
@@ -554,9 +572,10 @@ def admin_users(authorization: str = Header(None)):
     users, uid = current(authorization)
     if not users[uid].get("is_admin"): raise HTTPException(403)
     return [{"id": k, **profile(v), "devices": len(v.get("sessions", {})), "email_verified": bool(v.get("email_verified")),
+             "name": v.get("name", ""), "phone": v.get("phone", ""), "city": v.get("city", ""), "bar_no": v.get("bar_no", ""),
              "created": v.get("created", "")} for k, v in users.items() if k != "admin"]
 
-class AdminSet(BaseModel): id: str; package: str | None = None; expiry_date: str | None = None; add_days: int = 0
+class AdminSet(BaseModel): id: str; package: str | None = None; expiry_date: str | None = None; add_days: int = 0; disabled: bool | None = None; email_verified: bool | None = None
 
 @app.post("/admin/update")
 def admin_update(r: AdminSet, authorization: str = Header(None)):
@@ -565,6 +584,10 @@ def admin_update(r: AdminSet, authorization: str = Header(None)):
     v = users.get(r.id)
     if not v: raise HTTPException(404)
     if r.package in DAILY_LIMITS: v["package"] = r.package
+    if r.disabled is not None:
+        v["disabled"] = r.disabled
+        if r.disabled: v["sessions"] = {}          # band karte hi sab devices logout
+    if r.email_verified is not None: v["email_verified"] = r.email_verified
     if r.expiry_date: v["expiry_date"] = r.expiry_date
     if r.add_days:
         base = max(datetime.strptime(v["expiry_date"], "%Y-%m-%d").date(), date.today())
