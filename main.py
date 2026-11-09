@@ -1,5 +1,5 @@
 """Pakistani Legal AI - REST backend (FastAPI). Secrets sirf environment variables mein."""
-import hashlib, hmac, json, os, re, secrets, smtplib, ssl, time, traceback, urllib.error, urllib.request
+import hashlib, hmac, json, os, re, secrets, smtplib, ssl, threading, time, traceback, urllib.error, urllib.request
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from io import BytesIO
@@ -44,7 +44,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v16-nothinking", "model": MODEL}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v17-async", "model": MODEL}
 
 # ---------------------------------------------------------------- helpers
 def rj(path, default):
@@ -331,13 +331,18 @@ class AiReq(BaseModel):
     fields: dict = {}
     image_b64: str | None = None   # purana (ek tasveer)
     images_b64: list[str] | None = None   # nayi: kai tasveerein (JPEG)
+    id_images_b64: list[str] | None = None   # parties ke shanakhti card (CNIC) ki tasveerein
     template_id: str | None = None        # saved template (server par)
 
 def build_prompt(r: AiReq, has_template=False):
     f, L = r.fields, (TEMPLATE_INSTR if has_template else lang_instr(r.language)); blank = "(not provided - leave a clear blank placeholder)"; LP = lang_plain(r.language)
     g = lambda k: (f.get(k) or "").strip()
     if r.kind == "draft":
-        if not g("facts"): raise HTTPException(400, "Pehle facts likhein.")
+        if not (g("facts") or g("parties") or g("extra") or g("ref") or r.images_b64 or r.image_b64 or r.id_images_b64):
+            raise HTTPException(400, "Kam az kam parties, facts ya document/ID ki photo dein.")
+        nofacts = "" if g("facts") else ("\nNo facts were supplied: prepare the complete document with the standard recitals and grounds that are normal for this type of document, "
+                                        "and leave [____] blanks for case-specific facts, dates and amounts. Never invent facts.")
+        idnote = "\nParty details (full name, father's/husband's name, CNIC number, address) must be taken from the attached ID card images where provided; copy them exactly and do not guess unreadable characters." if r.id_images_b64 else ""
         return f"""{L}
 Follow standard Pakistani court drafting style and terminology.
 Prepare a complete, court-ready {g('category')} document: {g('doc_type')}
@@ -345,7 +350,7 @@ Prepare a complete, court-ready {g('category')} document: {g('doc_type')}
 - Parties: {g('parties') or blank}
 - Reference (FIR/Law): {g('ref') or blank}
 - Other details: {g('extra') or blank}
-- Facts & Grounds: {g('facts')}
+- Facts & Grounds: {g('facts') or blank}{nofacts}{idnote}
 Output only the finished document (no preface, notes or markdown symbols).""", f"Draft - {g('doc_type')}"
     if r.kind == "research":
         if not (g("section") or g("question")): raise HTTPException(400, "Section ya sawal likhein.")
@@ -395,23 +400,50 @@ Statutes are amended often, so state clearly that the advocate must verify the c
     raise HTTPException(400, "Unknown kind")
 
 def call_claude(content):
-    """Pehle 'thinking' band karke (taa-ke tokens jawab par lagen), phir bari bari dusre tareeqe aur purana model."""
-    client = anthropic.Anthropic(api_key=API_KEY)
+    """Har call ki hadd 110s, kul hadd 280s. Pehle thinking band, phir bari bari dusre tareeqe aur purana model."""
+    client = anthropic.Anthropic(api_key=API_KEY, timeout=110.0, max_retries=0)
     models = [MODEL] + (["claude-sonnet-4-6"] if MODEL != "claude-sonnet-4-6" else [])
+    deadline = time.time() + 280
     last = None
     for m in models:
         for extra, max_tokens in (({"thinking": {"type": "disabled"}}, 8000), ({}, 16000)):
+            if time.time() > deadline:
+                raise last or RuntimeError("AI ko bohat der lag gayi")
             try:
                 res = client.messages.create(model=m, max_tokens=max_tokens, system=SYSTEM, extra_body=extra,
                                              messages=[{"role": "user", "content": content}])
             except Exception as e:
                 last = e
+                print(f"[AI] {m} fail: {type(e).__name__}: {str(e)[:200]}", flush=True)
                 continue
             text = "".join(b.text for b in res.content if getattr(b, "type", "") == "text").strip()
             if text:
                 return text
             last = RuntimeError(f"AI ne khali jawab diya (stop_reason: {getattr(res, 'stop_reason', '?')})")
     raise last or RuntimeError("AI se koi jawab nahi mila")
+
+# Lambay jawab ke liye job system: /ai foran job id deta hai, app /ai/job/{id} poochti rehti hai
+JOBS, JOBS_LOCK = {}, threading.Lock()
+
+def _run_job(jid, uid, r, content, label, lim, ckey):
+    try:
+        text = call_claude(content)
+    except Exception as e:
+        with JOBS_LOCK: JOBS[jid].update(status="error", code=502, detail=f"AI se jawab nahi aa saka ({type(e).__name__}): {str(e)[:220]}")
+        return
+    used = 0
+    try:
+        if r.kind == "category":
+            cache = rj(CAT_CACHE, {}); cache[ckey] = {"text": text, "ts": time.time()}; wj(CAT_CACHE, cache)
+        users = load_users(); u = users.get(uid)       # taaza load: dusri requests ke count overwrite na hon
+        if u is not None:
+            u["prompt_count"] = u.get("prompt_count", 0) + 1; used = u["prompt_count"]; wj(USERS_FILE, users)
+        hist = rj(dpath(uid, "history"), [])
+        hist.append({"time": datetime.now().strftime("%d-%m-%Y %H:%M"), "type": label, "result": text, "lang": r.language})
+        wj(dpath(uid, "history"), hist[-300:])
+    except Exception:
+        traceback.print_exc()          # save fail ho bhi jaye to jawab user ko zaroor milay
+    with JOBS_LOCK: JOBS[jid].update(status="done", data={"result": text, "type": label, "used": used, "limit": lim})
 
 @app.post("/ai")
 def ai(r: AiReq, authorization: str = Header(None)):
@@ -433,7 +465,9 @@ def ai(r: AiReq, authorization: str = Header(None)):
     prompt, label = build_prompt(r, bool(tmpl))
     imgs = [i for i in (list(r.images_b64 or []) + ([r.image_b64] if r.image_b64 else [])) if i]
     if len(imgs) > 5: raise HTTPException(400, "Ek waqt mein ziyada se ziyada 5 tasveerein dein.")
-    if any(len(i) > 2_000_000 for i in imgs): raise HTTPException(400, "Koi tasveer bohat bari hai.")
+    ids = [i for i in (r.id_images_b64 or []) if i]
+    if len(ids) > 4: raise HTTPException(400, "ID card ki ziyada se ziyada 4 tasveerein dein.")
+    if any(len(i) > 2_000_000 for i in imgs + ids): raise HTTPException(400, "Koi tasveer bohat bari hai.")
     img_block = lambda i: {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": i}}
     blocks = []
     if tmpl:
@@ -442,18 +476,26 @@ def ai(r: AiReq, authorization: str = Header(None)):
     if imgs:
         blocks.append({"type": "text", "text": "CASE DOCUMENTS (FIR / order photos - use for facts only):"})
         blocks += [img_block(i) for i in imgs]
+    if ids:
+        blocks.append({"type": "text", "text": "ID CARDS (CNIC of the parties - read names, father/husband name, CNIC number and address for the party blocks):"})
+        blocks += [img_block(i) for i in ids]
     content = (blocks + [{"type": "text", "text": prompt}]) if blocks else prompt
-    try:
-        text = call_claude(content)
-    except Exception as e:
-        raise HTTPException(502, f"AI se jawab nahi aa saka ({type(e).__name__}): {str(e)[:220]}")
-    if r.kind == "category":
-        cache = rj(CAT_CACHE, {}); cache[ckey] = {"text": text, "ts": time.time()}; wj(CAT_CACHE, cache)
-    u["prompt_count"] = u.get("prompt_count", 0) + 1; wj(USERS_FILE, users)
-    hist = rj(dpath(uid, "history"), [])
-    hist.append({"time": datetime.now().strftime("%d-%m-%Y %H:%M"), "type": label, "result": text, "lang": r.language})
-    wj(dpath(uid, "history"), hist[-300:])
-    return {"result": text, "type": label, "used": u["prompt_count"], "limit": lim}
+    jid = secrets.token_hex(8); now = time.time()
+    with JOBS_LOCK:
+        for k in [k for k, v in JOBS.items() if now - v["ts"] > 3600]: del JOBS[k]
+        JOBS[jid] = {"uid": uid, "status": "pending", "ts": now}
+    threading.Thread(target=_run_job, args=(jid, uid, r, content, label, lim, ckey), daemon=True).start()
+    return {"job": jid}
+
+@app.get("/ai/job/{jid}")
+def ai_job(jid: str, authorization: str = Header(None)):
+    _, uid = current(authorization, True)
+    with JOBS_LOCK: j = JOBS.get(jid)
+    if not j or j["uid"] != uid: raise HTTPException(404, "Ye request nahi mili (server restart ho gaya hoga). Dobara try karein.")
+    if j["status"] == "pending": return {"status": "pending"}
+    with JOBS_LOCK: JOBS.pop(jid, None)
+    if j["status"] == "error": raise HTTPException(j["code"], j["detail"])
+    return {"status": "done", **j["data"]}
 
 # ---------------------------------------------------------------- templates (advocate ke apne draft ki photos)
 class TemplateIn(BaseModel): name: str; images_b64: list[str]
