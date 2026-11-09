@@ -44,7 +44,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v15-fix500", "model": MODEL}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v16-nothinking", "model": MODEL}
 
 # ---------------------------------------------------------------- helpers
 def rj(path, default):
@@ -394,6 +394,25 @@ Use these headings: 1) Name of the law and the section title; 2) Text or substan
 Statutes are amended often, so state clearly that the advocate must verify the current text on the official Pakistan Code website before relying on it. Never invent section numbers, text or citations.""", (f"Dafa - {g('section')} {g('law')}")[:80]
     raise HTTPException(400, "Unknown kind")
 
+def call_claude(content):
+    """Pehle 'thinking' band karke (taa-ke tokens jawab par lagen), phir bari bari dusre tareeqe aur purana model."""
+    client = anthropic.Anthropic(api_key=API_KEY)
+    models = [MODEL] + (["claude-sonnet-4-6"] if MODEL != "claude-sonnet-4-6" else [])
+    last = None
+    for m in models:
+        for extra, max_tokens in (({"thinking": {"type": "disabled"}}, 8000), ({}, 16000)):
+            try:
+                res = client.messages.create(model=m, max_tokens=max_tokens, system=SYSTEM, extra_body=extra,
+                                             messages=[{"role": "user", "content": content}])
+            except Exception as e:
+                last = e
+                continue
+            text = "".join(b.text for b in res.content if getattr(b, "type", "") == "text").strip()
+            if text:
+                return text
+            last = RuntimeError(f"AI ne khali jawab diya (stop_reason: {getattr(res, 'stop_reason', '?')})")
+    raise last or RuntimeError("AI se koi jawab nahi mila")
+
 @app.post("/ai")
 def ai(r: AiReq, authorization: str = Header(None)):
     users, uid = current(authorization); u = users[uid]
@@ -424,19 +443,10 @@ def ai(r: AiReq, authorization: str = Header(None)):
         blocks.append({"type": "text", "text": "CASE DOCUMENTS (FIR / order photos - use for facts only):"})
         blocks += [img_block(i) for i in imgs]
     content = (blocks + [{"type": "text", "text": prompt}]) if blocks else prompt
-    client = anthropic.Anthropic(api_key=API_KEY)
-    res, last_err = None, None
-    for m in ([MODEL] + (["claude-sonnet-4-6"] if MODEL != "claude-sonnet-4-6" else [])):   # naya model na chale to purana
-        try:
-            res = client.messages.create(model=m, max_tokens=6000, system=SYSTEM, messages=[{"role": "user", "content": content}])
-            break
-        except Exception as e:
-            last_err = e
-    if res is None:
-        raise HTTPException(502, f"AI se jawab nahi aa saka ({type(last_err).__name__}): {str(last_err)[:220]}")
-    text = "".join(b.text for b in res.content if getattr(b, "type", "") == "text").strip()
-    if not text:
-        raise HTTPException(502, f"AI ne khali jawab diya (stop_reason: {getattr(res, 'stop_reason', '?')}). Dobara try karein.")
+    try:
+        text = call_claude(content)
+    except Exception as e:
+        raise HTTPException(502, f"AI se jawab nahi aa saka ({type(e).__name__}): {str(e)[:220]}")
     if r.kind == "category":
         cache = rj(CAT_CACHE, {}); cache[ckey] = {"text": text, "ts": time.time()}; wj(CAT_CACHE, cache)
     u["prompt_count"] = u.get("prompt_count", 0) + 1; wj(USERS_FILE, users)
