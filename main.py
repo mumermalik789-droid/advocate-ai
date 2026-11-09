@@ -1,5 +1,5 @@
 """Pakistani Legal AI - REST backend (FastAPI). Secrets sirf environment variables mein."""
-import hashlib, hmac, json, os, re, secrets, smtplib, ssl, time, urllib.error, urllib.request
+import hashlib, hmac, json, os, re, secrets, smtplib, ssl, time, traceback, urllib.error, urllib.request
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from io import BytesIO
@@ -8,9 +8,9 @@ import anthropic, docx
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -35,11 +35,16 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 app = FastAPI(title="Advocate AI API")
 # Chrome (Flutter web) mein test ke liye. Asli server par allow_origins mein apni website likhein.
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    traceback.print_exception(type(exc), exc, exc.__traceback__)      # Render ke Logs mein poori wajah
+    return JSONResponse(status_code=500, content={"detail": f"Server error ({type(exc).__name__}): {str(exc)[:160]}"})
+
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API"}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v15-fix500", "model": MODEL}
 
 # ---------------------------------------------------------------- helpers
 def rj(path, default):
@@ -419,12 +424,19 @@ def ai(r: AiReq, authorization: str = Header(None)):
         blocks.append({"type": "text", "text": "CASE DOCUMENTS (FIR / order photos - use for facts only):"})
         blocks += [img_block(i) for i in imgs]
     content = (blocks + [{"type": "text", "text": prompt}]) if blocks else prompt
-    try:
-        res = anthropic.Anthropic(api_key=API_KEY).messages.create(
-            model=MODEL, max_tokens=6000, system=SYSTEM, messages=[{"role": "user", "content": content}])
-    except Exception as e:
-        raise HTTPException(502, f"AI se jawab nahi aa saka: {e}")
-    text = res.content[0].text
+    client = anthropic.Anthropic(api_key=API_KEY)
+    res, last_err = None, None
+    for m in ([MODEL] + (["claude-sonnet-4-6"] if MODEL != "claude-sonnet-4-6" else [])):   # naya model na chale to purana
+        try:
+            res = client.messages.create(model=m, max_tokens=6000, system=SYSTEM, messages=[{"role": "user", "content": content}])
+            break
+        except Exception as e:
+            last_err = e
+    if res is None:
+        raise HTTPException(502, f"AI se jawab nahi aa saka ({type(last_err).__name__}): {str(last_err)[:220]}")
+    text = "".join(b.text for b in res.content if getattr(b, "type", "") == "text").strip()
+    if not text:
+        raise HTTPException(502, f"AI ne khali jawab diya (stop_reason: {getattr(res, 'stop_reason', '?')}). Dobara try karein.")
     if r.kind == "category":
         cache = rj(CAT_CACHE, {}); cache[ckey] = {"text": text, "ts": time.time()}; wj(CAT_CACHE, cache)
     u["prompt_count"] = u.get("prompt_count", 0) + 1; wj(USERS_FILE, users)
