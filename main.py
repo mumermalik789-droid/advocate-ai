@@ -13,6 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+import citations as cit      # verified citations only
+import court_sync as cs      # district court case sync
+
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")      # code mein kabhi na likhein
 SMTP_HOST, SMTP_PORT = "smtp.gmail.com", 587
@@ -44,7 +47,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v18", "model": MODEL, "data_dir": DATA}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v19", "model": MODEL, "data_dir": DATA}
 
 # ---------------------------------------------------------------- helpers
 def rj(path, default):
@@ -292,7 +295,7 @@ SYSTEM = ("You are a Senior Advocate of the High Court and Supreme Court of Paki
           "numbered paragraphs, grounds, prayer, verification/affidavit and signature block where applicable. Use a formal, "
           "precise, professional pleading register at all times, never a chatty or simplified tone. Do not add introductions, "
           "notes or explanations outside the document and do not use markdown symbols (#, *, tables). Put unknown facts in "
-          "square-bracket blanks such as [____]. If you are not certain a citation is real, say so clearly instead of inventing one.")
+          "square-bracket blanks such as [____]. Never cite a case, reporter citation or judgment from memory: cite case law only when it is supplied under VERIFIED AUTHORITIES, otherwise cite none.")
 
 URDU_STYLE = (
     "IMPORTANT: Write the ENTIRE document in formal, professional Pakistani court Urdu, exactly as a senior advocate drafts "
@@ -377,7 +380,7 @@ Conduct legal research on Pakistani law: {g('act')}
 - Provision: {g('section')}
 - Precedents from: {g('court')}
 - Question/Facts: {g('question')}
-Give the bare-act position, key principles and leading case law. Mark any citation you are unsure of.""", f"Research - {g('act')}"
+Give the bare-act position and key principles. For case law use ONLY the VERIFIED AUTHORITIES supplied; if none apply, say that precedents must be searched on Pakistan Law Site or East Law.""", f"Research - {g('act')}"
     if r.kind == "citation":
         if not g("citation"): raise HTTPException(400, "Citation likhein.")
         return f"""{LP}
@@ -413,7 +416,7 @@ Be explicit about anything you are not certain of and never invent section numbe
         q = ("Specific question: " + g("question")) if g("question") else ""
         return f"""{LP}
 Explain this provision of Pakistani law for an advocate. Law: {law}. Provision: {g('section')}. {q}
-Use these headings: 1) Name of the law and the section title; 2) Text or substance of the provision (if you cannot recall the exact wording, give the substance and say so); 3) Essential ingredients; 4) Punishment or relief, and for offences whether bailable or non-bailable, cognizable or non-cognizable, compoundable, and the court of trial; 5) Important amendments you know of; 6) Related and alternative sections; 7) Leading case law (mark any citation you are not sure of); 8) Practical points for bail, quashing or defence.
+Use these headings: 1) Name of the law and the section title; 2) Text or substance of the provision (if you cannot recall the exact wording, give the substance and say so); 3) Essential ingredients; 4) Punishment or relief, and for offences whether bailable or non-bailable, cognizable or non-cognizable, compoundable, and the court of trial; 5) Important amendments you know of; 6) Related and alternative sections; 7) Leading case law (ONLY from the VERIFIED AUTHORITIES supplied; if none, write 'none in verified database'); 8) Practical points for bail, quashing or defence.
 Statutes are amended often, so state clearly that the advocate must verify the current text on the official Pakistan Code website before relying on it. Never invent section numbers, text or citations.""", (f"Dafa - {g('section')} {g('law')}")[:80]
     raise HTTPException(400, "Unknown kind")
 
@@ -449,6 +452,9 @@ def _run_job(jid, uid, r, content, label, lim, ckey):
     except Exception as e:
         with JOBS_LOCK: JOBS[jid].update(status="error", code=502, detail=f"AI se jawab nahi aa saka ({type(e).__name__}): {str(e)[:220]}")
         return
+    cites = []
+    if r.kind in ("draft", "research", "section", "fir"):      # flag any citation that is not in the verified index
+        text, cites = cit.scrub(text, dpath(uid, "mycitations"))
     used = 0
     try:
         if r.kind == "category":
@@ -461,13 +467,18 @@ def _run_job(jid, uid, r, content, label, lim, ckey):
         wj(dpath(uid, "history"), hist[-300:])
     except Exception:
         traceback.print_exc()          # save fail ho bhi jaye to jawab user ko zaroor milay
-    with JOBS_LOCK: JOBS[jid].update(status="done", data={"result": text, "type": label, "used": used, "limit": lim})
+    with JOBS_LOCK: JOBS[jid].update(status="done", data={"result": text, "type": label, "used": used, "limit": lim, "citations": cites})
 
 @app.post("/ai")
 def ai(r: AiReq, authorization: str = Header(None)):
     users, uid = current(authorization); u = users[uid]
     lim = DAILY_LIMITS.get(u.get("package"))
     ckey = f"{(r.fields or {}).get('category', '')}|{r.language}"
+    if r.kind == "citation":      # verified-index lookup only: the AI is never asked if a case is real
+        txt = (r.fields or {}).get("citation", "")
+        if not txt.strip(): raise HTTPException(400, "Citation likhein.")
+        v = cit.verify(txt, dpath(uid, "mycitations"), r.language)
+        return {"result": v["report"], "type": "Citation Check", "used": u.get("prompt_count", 0), "limit": lim, "citations": v["items"]}
     if r.kind == "category":      # ek hi list sab ke liye: cache mein ho to free aur foran
         hit = rj(CAT_CACHE, {}).get(ckey)
         if hit and time.time() - hit.get("ts", 0) < 30 * 86400:
@@ -481,6 +492,9 @@ def ai(r: AiReq, authorization: str = Header(None)):
             if t.get("id") == r.template_id: tmpl = t.get("images", [])
         if not tmpl: raise HTTPException(404, "Ye template nahi mila.")
     prompt, label = build_prompt(r, bool(tmpl))
+    if r.kind in ("draft", "research", "section"):      # only verified authorities may be cited
+        q = " ".join(v for v in (r.fields or {}).values() if isinstance(v, str))[:600]
+        prompt = cit.authorities_block(q, dpath(uid, "mycitations")) + "\n\n" + prompt
     imgs = [i for i in (list(r.images_b64 or []) + ([r.image_b64] if r.image_b64 else [])) if i]
     if len(imgs) > 5: raise HTTPException(400, "Ek waqt mein ziyada se ziyada 5 tasveerein dein.")
     ids = [i for i in (r.id_images_b64 or []) if i]
@@ -565,6 +579,79 @@ def export_docx(r: Export, authorization: str = Header(None)):
             else: run.font.name, run.font.size = "Calibri", Pt(12)
     bio = BytesIO(); d.save(bio)
     return Response(bio.getvalue(), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+# ---------------------------------------------------------------- verified citations
+class CitVerify(BaseModel): text: str; language: str = "English"
+class CitIn(BaseModel): citation: str; title: str; court: str = ""; summary: str = ""; verified_from: str = ""
+class CitImport(BaseModel): text: str; source: str = ""
+
+@app.post("/citations/verify")
+def citations_verify(r: CitVerify, authorization: str = Header(None)):
+    _, uid = current(authorization)
+    return cit.verify(r.text, dpath(uid, "mycitations"), r.language)
+
+@app.post("/citations/mine")
+def citations_mine(r: CitIn, authorization: str = Header(None)):
+    """Advocate confirmed it himself (e.g. on Pakistan Law Site): saved to his own library, labelled as his confirmation."""
+    users, uid = current(authorization)
+    ok, msg = cit.add_user(dpath(uid, "mycitations"), {"citation": r.citation, "title": r.title, "court": r.court, "summary": r.summary,
+                                                      "source": f"user-verified ({r.verified_from.strip() or 'source not stated'})",
+                                                      "verified_by": users[uid]["chamber_name"]})
+    if not ok: raise HTTPException(400, msg)
+    return {"ok": True}
+
+@app.post("/citations/import")
+def citations_import(r: CitImport, authorization: str = Header(None)):
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403)
+    return cit.import_text(r.text, r.source)
+
+# ---------------------------------------------------------------- district court case sync
+class CasesIn(BaseModel): raw: str; district: str = ""; ps: str = ""
+class CasesConfirm(BaseModel): client_index: int; row: dict
+
+@app.post("/cases/ingest")
+def cases_ingest(r: CasesIn, authorization: str = Header(None)):
+    _, uid = current(authorization)
+    if len(r.raw) > 600_000: raise HTTPException(400, "Paste kiya hua text bohat bara hai.")
+    path = dpath(uid, "clients"); clients = rj(path, [])
+    res = cs.ingest(r.raw, clients, r.district, r.ps)
+    if res["updated"]: wj(path, clients)
+    return res
+
+@app.post("/cases/confirm")
+def cases_confirm(r: CasesConfirm, authorization: str = Header(None)):
+    _, uid = current(authorization)
+    path = dpath(uid, "clients"); clients = rj(path, [])
+    if not 0 <= r.client_index < len(clients): raise HTTPException(404, "Client nahi mila.")
+    ch = cs.apply(clients[r.client_index], cs.clean_row(r.row)); wj(path, clients)
+    return {"changes": ch}
+
+# Full automation switch: only if PITB / D&SJ grants an official feed (set COURT_API_URL and COURT_API_KEY on the server).
+COURT_API_URL, COURT_API_KEY = os.environ.get("COURT_API_URL", ""), os.environ.get("COURT_API_KEY", "")
+
+def _court_poll_once():
+    for fn in os.listdir(DATA):
+        if not fn.endswith("_clients.json"): continue
+        path, changed = f"{DATA}/{fn}", False
+        clients = rj(path, [])
+        for c in clients:
+            try: res = cs.sync_one(c, cs.fetch_official(COURT_API_URL, COURT_API_KEY, c))
+            except Exception as e:
+                print(f"[court] feed error: {type(e).__name__}: {str(e)[:120]}", flush=True); continue
+            changed = changed or bool(res)
+            time.sleep(1)                                   # be gentle with the feed
+        if changed: wj(path, clients)
+
+def _court_poller():
+    while True:
+        try: _court_poll_once()
+        except Exception: traceback.print_exc()
+        time.sleep(max(1.0, float(os.environ.get("COURT_POLL_HOURS", "6"))) * 3600)
+
+@app.on_event("startup")
+def _start_court_poller():
+    if COURT_API_URL: threading.Thread(target=_court_poller, daemon=True).start()
 
 # ---------------------------------------------------------------- admin
 @app.get("/admin/users")
