@@ -13,8 +13,424 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-import citations as cit      # verified citations only
-import court_sync as cs      # district court case sync
+import types
+
+
+def _embed(name, src):
+    mod = types.ModuleType(name); exec(compile(src, name + '.py', 'exec'), mod.__dict__); return mod
+
+
+cit = _embed('citations', r'''"""Verified-citation engine (stdlib only).
+
+Rule: a case citation is shown as authentic ONLY if it exists in a verified index. No LLM is ever asked whether a
+case is real. The index is filled from lawful sources: official court websites, notes you typed or exported from your
+own Pakistan Law Site / East Law subscription, or entries an advocate marks as 'verified by me'."""
+import csv, io, json, os, re, secrets, threading
+from datetime import date
+
+DATA = os.environ.get("DATA_DIR", "data")
+GLOBAL_IDX = f"{DATA}/verified_citations.jsonl"
+_LOCK, _CACHE = threading.Lock(), {"mtime": None, "rows": {}}
+
+# First eight are the reporters Pakistan Law Site publishes. Other codes are recognised; name left blank if unsure.
+REPORTERS = {"PLD": "Pakistan Legal Decisions", "SCMR": "Supreme Court Monthly Review", "CLC": "Civil Law Cases",
+             "CLD": "Corporate Law Decisions", "YLR": "Yearly Law Reporter", "PCRLJ": "Pakistan Criminal Law Journal",
+             "PTD": "Pakistan Tax Decisions", "PLC": "Pakistan Labour Cases",
+             "MLD": "", "PLJ": "", "NLR": "", "GBLR": "", "SBLR": "", "PTCL": ""}
+COURTS = {"SC": "Supreme Court of Pakistan", "FSC": "Federal Shariat Court", "LAHORE": "Lahore High Court",
+          "LHR": "Lahore High Court", "LHC": "Lahore High Court", "KARACHI": "Sindh High Court", "KAR": "Sindh High Court",
+          "SINDH": "Sindh High Court", "PESHAWAR": "Peshawar High Court", "PESH": "Peshawar High Court",
+          "QUETTA": "Balochistan High Court", "BALOCHISTAN": "Balochistan High Court", "BALOCH": "Balochistan High Court",
+          "ISLAMABAD": "Islamabad High Court", "ISL": "Islamabad High Court", "IHC": "Islamabad High Court",
+          "AJ&K": "Azad Jammu & Kashmir", "AJK": "Azad Jammu & Kashmir", "GB": "Gilgit-Baltistan"}
+_SHORT = {"Supreme Court of Pakistan": "SC", "Federal Shariat Court": "FSC", "Lahore High Court": "Lahore",
+          "Sindh High Court": "Sindh", "Peshawar High Court": "Peshawar", "Balochistan High Court": "Quetta",
+          "Islamabad High Court": "Islamabad", "Azad Jammu & Kashmir": "AJ&K", "Gilgit-Baltistan": "GB"}
+_CODES = "|".join(sorted(REPORTERS, key=len, reverse=True))
+_CT = "|".join(sorted((re.escape(k) for k in COURTS), key=len, reverse=True))
+# PLD 2020 SC 1  |  2021 SCMR 1234  |  2020 YLR 123 (Lahore)
+_A = re.compile(rf"\b(?P<code>{_CODES})\s*(?P<year>(?:19|20)\d\d)\s*(?P<court>{_CT})\s*(?P<page>\d{{1,4}})\b", re.I)
+_B = re.compile(rf"\b(?P<year>(?:19|20)\d\d)\s*(?P<code>{_CODES})\s*(?:[(\[]\s*(?P<c1>{_CT})\s*[)\]]\s*)?"
+                rf"(?P<page>\d{{1,4}})\b(?:\s*[(\[]\s*(?P<c2>{_CT})\s*[)\]])?", re.I)
+
+MSG = {
+    "English": {"verified": "VERIFIED ✔ found in the verified database",
+                "unindexed": "NOT CONFIRMED - format is valid but it is not in the verified database. Do not rely on it until you check it on Pakistan Law Site, EastLaw or the court's own website.",
+                "implausible_year": "NOT VALID - this year is impossible for a Pakistani law report.",
+                "invalid": "This is not a recognised Pakistani law-report citation. Expected forms: PLD 2020 SC 1, 2021 SCMR 1234, 2020 YLR 123 (Lahore).",
+                "source": "Source", "open": "Check at"},
+    "Roman": {"verified": "TASDEEQ SHUDA ✔ verified database mein maujood hai",
+              "unindexed": "TASDEEQ NAHI HUI - format durust hai magar verified database mein nahi. Pakistan Law Site, EastLaw ya court ki apni website par check kiye baghair is par bharosa na karein.",
+              "implausible_year": "GHALAT - ye saal Pakistani law report ke liye mumkin nahi.",
+              "invalid": "Ye Pakistani law-report ka durust citation nahi lagta. Durust misalein: PLD 2020 SC 1, 2021 SCMR 1234, 2020 YLR 123 (Lahore).",
+              "source": "Zareya", "open": "Yahan check karein"},
+    "Urdu": {"verified": "تصدیق شدہ ✔ تصدیق شدہ ڈیٹا بیس میں موجود ہے",
+             "unindexed": "تصدیق نہیں ہوئی - فارمیٹ درست ہے مگر تصدیق شدہ ڈیٹا بیس میں موجود نہیں۔ پاکستان لا سائٹ، ایسٹ لا یا عدالت کی اپنی ویب سائٹ پر دیکھے بغیر اس پر انحصار نہ کریں۔",
+             "implausible_year": "غلط - یہ سال پاکستانی لاء رپورٹ کے لیے ممکن نہیں۔",
+             "invalid": "یہ پاکستانی لاء رپورٹ کا درست حوالہ نہیں۔ درست مثالیں: PLD 2020 SC 1، 2021 SCMR 1234، 2020 YLR 123 (Lahore)",
+             "source": "ذریعہ", "open": "یہاں دیکھیں"},
+}
+
+
+def _find(text):
+    ms = sorted([*_A.finditer(text or ""), *_B.finditer(text or "")], key=lambda m: (m.start(), -m.end()))
+    out, end = [], -1
+    for m in ms:
+        if m.start() >= end: out.append(m); end = m.end()
+    return out
+
+
+def _norm(m):
+    g = m.groupdict(); code = g["code"].upper(); year, page = int(g["year"]), int(g["page"])
+    ck = (g.get("court") or g.get("c1") or g.get("c2") or "").upper(); court = COURTS.get(ck, "")
+    sc = "PCrLJ" if code == "PCRLJ" else code
+    if code == "PLD": key, shown = f"PLD|{year}|{court}|{page}", f"PLD {year} {_SHORT.get(court, ck.title())} {page}"
+    else: key, shown = f"{sc}|{year}||{page}", f"{year} {sc} {page}"
+    return key, shown, {"code": sc, "reporter": REPORTERS.get(code, ""), "year": year, "court": court, "page": page}
+
+
+def _read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f: return json.load(f)
+    except Exception: return default
+
+
+def _write_json(path, data):
+    tmp = f"{path}.{secrets.token_hex(3)}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def _read_jsonl(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for ln in f:
+                try: out.append(json.loads(ln))
+                except ValueError: pass
+    except OSError: pass
+    return out
+
+
+def _rows_to_idx(rows):
+    idx = {}
+    for r in rows:
+        if not isinstance(r, dict): continue
+        ms = _find(str(r.get("citation", "")))
+        if len(ms) == 1: idx[_norm(ms[0])[0]] = r
+    return idx
+
+
+def index(user_path=None):
+    """Global verified index + this advocate's own 'verified by me' library (his entries win)."""
+    try: mt = os.path.getmtime(GLOBAL_IDX)
+    except OSError: mt = None
+    with _LOCK:
+        if _CACHE["mtime"] != mt: _CACHE["rows"], _CACHE["mtime"] = _rows_to_idx(_read_jsonl(GLOBAL_IDX)), mt
+        g = _CACHE["rows"]
+    return {**g, **(_rows_to_idx(_read_json(user_path, [])) if user_path else {})}
+
+
+def authorities(query, user_path=None, limit=8):
+    toks = set(re.findall(r"[a-z0-9]{3,}", (query or "").lower()))
+    if not toks: return []
+    need, scored = min(2, len(toks)), []
+    for r in index(user_path).values():
+        hay = " ".join(str(r.get(k, "")) for k in ("title", "summary", "keywords", "sections", "court")).lower()
+        s = sum(1 for t in toks if t in hay)
+        if s >= need: scored.append((s, r))
+    scored.sort(key=lambda x: -x[0])
+    return [r for _, r in scored[:limit]]
+
+
+def authorities_block(query, user_path=None):
+    head = ("CITATION POLICY (mandatory): never cite a case, reporter citation or judgment from your own memory. "
+            "Cite case law ONLY from the VERIFIED AUTHORITIES below, copied exactly as written. ")
+    a = authorities(query, user_path)
+    if not a:
+        return head + ("VERIFIED AUTHORITIES: none found in the verified database for this topic. Give the statutory position and "
+                       "principles only, and write 'Precedents: to be searched on Pakistan Law Site / East Law and added after verification' "
+                       "instead of citing any case.")
+    return head + "VERIFIED AUTHORITIES:\n" + "\n".join(
+        f"- {r['citation']} | {r.get('title', '')} | {r.get('court', '')} | {str(r.get('summary', ''))[:350]}" for r in a)
+
+
+def scrub(text, user_path=None):
+    """Mark every citation-looking string in model output that is not in the verified index. Returns (text, report)."""
+    idx, out, last, rep = index(user_path), [], 0, []
+    for m in _find(text):
+        key, shown, _ = _norm(m); rec = idx.get(key)
+        out.append(text[last:m.start()])
+        out.append(m.group(0) if rec else f"[CITATION NOT VERIFIED: {m.group(0)}]")
+        rep.append({"citation": shown, "status": "verified" if rec else "unverified", "title": (rec or {}).get("title", "")})
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out), rep
+
+
+def _links(meta):
+    L = [("Pakistan Law Site", "https://www.pakistanlawsite.com/"), ("EastLaw", "https://eastlaw.pk/")]
+    if meta["code"] == "SCMR" or meta["court"] == "Supreme Court of Pakistan": L.append(("Supreme Court of Pakistan", "https://www.supremecourt.gov.pk/"))
+    elif meta["court"] == "Lahore High Court": L.append(("Lahore High Court", "https://lhc.gov.pk/"))
+    return L
+
+
+def verify(text, user_path=None, language="English"):
+    M = MSG["Urdu" if language.startswith("Urdu") else "Roman" if language.startswith("Roman") else "English"]
+    idx, items = index(user_path), []
+    for m in _find(text):
+        key, shown, meta = _norm(m); rec = idx.get(key)
+        st = "implausible_year" if not (1947 <= meta["year"] <= date.today().year) else ("verified" if rec else "unindexed")
+        items.append({"input": m.group(0), "citation": shown, **meta, "status": st, "links": _links(meta),
+                      "record": {k: str(rec.get(k, "")) for k in ("title", "court", "date", "bench", "summary", "url", "source", "verified_by")} if rec else None})
+    if not items: return {"status": "invalid_format", "items": [], "report": M["invalid"]}
+    lines = []
+    for it in items:
+        lines.append(f"{it['citation']}  -  {M[it['status']]}")
+        r = it["record"]
+        if r:
+            lines.append(f"   {r['title']} | {r['court']} {r['date']}".rstrip())
+            lines.append(f"   {M['source']}: {r['source']}" + (f" ({r['verified_by']})" if r["verified_by"] else ""))
+            if r["summary"]: lines.append(f"   {r['summary']}")
+        else: lines.append("   " + M["open"] + ": " + " | ".join(f"{n}: {u}" for n, u in it["links"]))
+    return {"status": items[0]["status"], "items": items, "report": "\n".join(lines)}
+
+
+def add_user(user_path, rec):
+    """Advocate confirmed this citation himself (e.g. on Pakistan Law Site) and saves it to his own library."""
+    ms = _find(rec.get("citation", ""))
+    if len(ms) != 1: return False, "Citation ka format durust nahi (misal: PLD 2020 SC 1)."
+    if not str(rec.get("title", "")).strip(): return False, "Case ka title (parties) likhein."
+    rows, (key, shown, _) = _read_json(user_path, []), _norm(ms[0])
+    if key in _rows_to_idx(rows): return False, "Ye citation aap ki library mein pehle se hai."
+    if len(rows) >= 3000: return False, "Library full hai."
+    rows.append({**{k: str(rec.get(k, ""))[:600] for k in ("title", "court", "summary", "source", "verified_by")},
+                 "citation": shown, "added": date.today().isoformat()})
+    _write_json(user_path, rows)
+    return True, ""
+
+
+def import_text(text, source=""):
+    """Admin: bulk-load JSONL or CSV (columns: citation,title,court,date,bench,summary,keywords,sections,url,source)."""
+    text, rows = (text or "").strip().lstrip("\ufeff"), []
+    if text.startswith("{"):
+        for ln in text.splitlines():
+            try: rows.append(json.loads(ln))
+            except ValueError: pass
+    else: rows = list(csv.DictReader(io.StringIO(text)))
+    have, new, skipped = _rows_to_idx(_read_jsonl(GLOBAL_IDX)), [], 0
+    for r in rows:
+        ms = _find(str(r.get("citation", "")))
+        if len(ms) != 1 or not str(r.get("title", "")).strip(): skipped += 1; continue
+        key, shown, _ = _norm(ms[0])
+        if key in have: skipped += 1; continue
+        r = {str(k): str(v)[:2000] for k, v in r.items() if k and v}
+        r["citation"], r["source"] = shown, r.get("source") or source or "import"
+        have[key] = r; new.append(r)
+    if new:
+        os.makedirs(DATA, exist_ok=True)
+        with _LOCK, open(GLOBAL_IDX, "a", encoding="utf-8") as f:
+            for r in new: f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return {"added": len(new), "skipped": skipped}
+''')      # verified citations only
+cs = _embed('court_sync', r'''"""Court sync for Punjab district courts (stdlib only).
+
+dsj.punjab.gov.pk asks a human arithmetic question before every search, and this module never answers it.
+Flow: the advocate searches on the portal himself, copies the result table and pastes it into the app -> parse ->
+match to his clients -> update. If PITB / D&SJ ever grants an official feed, fetch_official() + sync_one() reuse the
+same matching, so full automation is a configuration change (COURT_API_URL / COURT_API_KEY), not a rewrite."""
+import json, re, urllib.parse, urllib.request
+from datetime import date, datetime
+from html.parser import HTMLParser
+
+STOP = {"the", "and", "versus", "state", "son", "wife", "daughter", "muhammad", "mohammad", "mst", "mussammat"}
+_MON = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
+_PAIR = re.compile(r"(?<![\d/\-])(\d{1,6})\s*[/\-]\s*(\d{4}|\d{2})(?![\d/\-])")
+
+
+def _year(y):
+    y = int(y)
+    return y if y >= 100 else 2000 + y
+
+
+def _pairs_of(text):
+    return {(str(int(n)), _year(y)) for n, y in _PAIR.findall(text or "")}
+
+
+def _tok(s):
+    return {t for t in re.findall(r"[a-z]{3,}", (s or "").lower()) if t not in STOP}
+
+
+def _nt(s):
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def _dates(text):
+    raw = [(y, m, d) for d, m, y in re.findall(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})\b", text)]
+    raw += re.findall(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", text)
+    raw += [(y, str(_MON[mo.lower()]), d) for d, mo, y in re.findall(r"\b(\d{1,2})[\s-]([A-Za-z]{3})[a-z]*[\s,-]+(\d{4})\b", text) if mo.lower() in _MON]
+    out = []
+    for y, m, d in raw:
+        try: out.append(date(int(y), int(m), int(d)).isoformat())
+        except ValueError: pass
+    return out
+
+
+class _T(HTMLParser):
+    def __init__(s):
+        super().__init__(); s.rows, s.cur, s.cell, s.hdr = [], None, None, False
+
+    def handle_starttag(s, t, a):
+        if t == "tr": s.cur, s.hdr = [], False
+        elif t in ("td", "th") and s.cur is not None:
+            s.cell = []; s.hdr = s.hdr or t == "th"
+
+    def handle_endtag(s, t):
+        if t in ("td", "th") and s.cell is not None and s.cur is not None:
+            s.cur.append(re.sub(r"\s+", " ", "".join(s.cell)).strip()); s.cell = None
+        elif t == "tr" and s.cur is not None:
+            if any(s.cur): s.rows.append((s.hdr, s.cur))
+            s.cur = None
+
+    def handle_data(s, d):
+        if s.cell is not None: s.cell.append(d)
+
+
+def _row(cells, header):
+    text = " | ".join(cells)
+    r = {"text": text[:400], "pairs": _pairs_of(text), "date": "", "stage": "", "court": "", "ps": "", "title": ""}
+    for h, c in zip(header or [], cells):
+        if not c: continue
+        if "next" in h or "hearing" in h or ("date" in h and "institut" not in h and "decision" not in h):
+            ds = _dates(c); r["date"] = r["date"] or (ds[0] if ds else "")
+        elif "stage" in h or "status" in h or "purpose" in h: r["stage"] = c[:80]
+        elif "court" in h or "judge" in h: r["court"] = c[:80]
+        elif "police" in h or h.strip() in ("ps", "p.s", "p.s."): r["ps"] = c[:60]
+        elif "title" in h or "part" in h: r["title"] = c[:120]
+    if not r["date"]:
+        ds = sorted(set(_dates(text))); fut = [d for d in ds if d >= date.today().isoformat()]
+        r["date"] = fut[0] if fut else (ds[-1] if ds else "")
+    if not r["ps"]:
+        m = re.search(r"(?:P\.?\s?S\.?|Police Station|Thana)\s*[:\-]?\s*([^|,;\n]{2,40})", text, re.I)
+        if m: r["ps"] = m.group(1).strip()
+    r["tokens"] = _tok(text)
+    return r
+
+
+def parse(raw):
+    """HTML table, or text copied from a table (tab / 3+ spaces / pipe between cells, one row per line)."""
+    raw = raw or ""
+    if re.search(r"<tr[\s>]", raw, re.I):
+        p = _T(); p.feed(raw); rows = p.rows
+    else:
+        rows = []
+        for ln in raw.splitlines():
+            cells = [x.strip() for x in re.split(r"\t|\s{3,}|\s\|\s", ln) if x.strip()]
+            if cells: rows.append((False, cells))
+    header, out = None, []
+    for is_h, cells in rows:
+        if is_h: header = [x.lower() for x in cells]; continue
+        r = _row(cells, header)
+        if r["pairs"] or r["title"] or (r["date"] and len(cells) > 2): out.append(r)
+    return out
+
+
+def clean_row(r):
+    d = str(r.get("date", ""))[:10]
+    try: date.fromisoformat(d)
+    except ValueError: d = ""
+    return {"text": str(r.get("text", ""))[:400], "date": d, "stage": str(r.get("stage", ""))[:80], "court": str(r.get("court", ""))[:80],
+            "ps": str(r.get("ps", ""))[:60], "title": str(r.get("title", ""))[:120], "pairs": sorted([n, y] for n, y in r.get("pairs", []) or [])}
+
+
+def _score(client, row, hint_ps=""):
+    ids = _pairs_of(f"{client.get('fir', '')} {client.get('case_no', '')}")
+    nm = _tok(client.get("name", ""))
+    if not (ids & set(map(tuple, row["pairs"]))):
+        if len(nm) >= 2 and nm <= row.get("tokens", set()): return 50, "naam milta hai magar FIR/case number nahi milta"
+        return 0, ""
+    s, why = 80, "FIR/case number aur saal milte hain"
+    ctext = _nt(" ".join(str(client.get(k, "")) for k in ("fir", "court", "notes", "ps")))
+    rps = _nt(row.get("ps") or hint_ps)
+    if rps and rps in ctext: s, why = s + 15, why + ", thana bhi"
+    if nm and nm & row.get("tokens", set()): s, why = s + 10, why + ", naam bhi"
+    return s, why
+
+
+def apply(c, row, today=None):
+    """Update one client from one portal row. Returns a list of human-readable changes."""
+    today, ch, nd = today or date.today().isoformat(), [], row.get("date") or ""
+    if nd and nd >= today and nd != c.get("date"):
+        note = f"[{today}] Agli tareekh: {nd} (court portal) | {c.get('notes', '')}".rstrip(" |")
+        ch.append(f"agli peshi {c.get('date') or '-'} -> {nd}"); c["notes"], c["date"] = note, nd
+    if row.get("stage") and row["stage"] != c.get("stage"): ch.append(f"stage: {row['stage']}"); c["stage"] = row["stage"]
+    if row.get("court"):
+        c["court_portal"] = row["court"]
+        if not c.get("court"): c["court"] = row["court"]
+    h = c.setdefault("history", [])
+    ent = {"seen": today, "date": nd, "stage": row.get("stage", ""), "src": "dsj.punjab.gov.pk"}
+    if not any(isinstance(x, dict) and x.get("date") == nd and x.get("stage") == ent["stage"] for x in h):
+        h.append(ent); h[:] = h[-50:]
+    c["last_synced"] = datetime.now().isoformat(timespec="minutes")
+    return ch
+
+
+def _prev(r):
+    return " | ".join(x for x in (r.get("title"), r.get("date"), r.get("stage"), r.get("court")) if x) or r.get("text", "")[:120]
+
+
+def ingest(raw, clients, district="", ps="", today=None):
+    """Auto-update only when FIR/case number matches AND (thana or name) agrees and no other row ties; else ask the advocate."""
+    rows = parse(raw)
+    for r in rows:
+        if ps and not r["ps"]: r["ps"] = ps
+    updated, sugg, hit = [], [], set()
+    for i, c in enumerate(clients):
+        sc = sorted(((*_score(c, r, ps), k) for k, r in enumerate(rows)), key=lambda t: -t[0])
+        if not sc or sc[0][0] == 0: continue
+        s, why, k = sc[0]; tie = len(sc) > 1 and sc[1][0] >= s; hit.add(k)
+        if s >= 90 and not tie:
+            updated.append({"client": c.get("name", ""), "fir": c.get("fir", ""), "changes": apply(c, rows[k], today) or ["koi naya badlao nahi"]})
+        else:
+            sugg.append({"client_index": i, "client": c.get("name", ""), "preview": _prev(rows[k]), "row": clean_row(rows[k]),
+                         "why": why + (" (aik se ziyada rows milti hain)" if tie else "")})
+    return {"rows": len(rows), "updated": updated, "suggestions": sugg, "unmatched_rows": max(0, len(rows) - len(hit))}
+
+
+# ---- official feed (only if PITB / D&SJ grants one). Expected JSON: {"rows":[{"fir_no","fir_year","case_no","case_year",
+# "ps","title","next_date","stage","court"}]}
+def _n(v):
+    d = re.sub(r"\D", "", str(v or ""))
+    return int(d) if d else 0
+
+
+def rows_from_json(items):
+    out = []
+    for it in items or []:
+        pairs = {(str(_n(a)), _year(_n(b))) for a, b in ((it.get("fir_no"), it.get("fir_year")), (it.get("case_no"), it.get("case_year"))) if _n(a) and _n(b)}
+        text = " ".join(str(v) for v in it.values())
+        out.append({"text": text[:400], "pairs": pairs, "date": str(it.get("next_date") or it.get("date") or "")[:10], "stage": str(it.get("stage", ""))[:80],
+                    "court": str(it.get("court", ""))[:80], "ps": str(it.get("ps", ""))[:60], "title": str(it.get("title", ""))[:120], "tokens": _tok(text)})
+    return out
+
+
+def fetch_official(url, key, client, timeout=20):
+    ids = sorted(_pairs_of(f"{client.get('fir', '')} {client.get('case_no', '')}"))
+    if not ids: return []
+    q = urllib.parse.urlencode({"fir_no": ids[0][0], "fir_year": ids[0][1], "ps": client.get("ps", ""), "district": client.get("district", "")})
+    req = urllib.request.Request(f"{url}?{q}", headers={"X-Api-Key": key, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp: data = json.loads(resp.read().decode("utf-8"))
+    return rows_from_json(data.get("rows") if isinstance(data, dict) else data)
+
+
+def sync_one(client, rows, today=None):
+    """Feed path: the query was already specific to this client, so one FIR/case match is enough. None = no match."""
+    best = None
+    for r in rows:
+        s, _ = _score(client, r)
+        if s >= 80 and (best is None or s > best[0]): best = (s, r)
+    return apply(client, best[1], today) if best else None
+''')      # district court case sync
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")      # code mein kabhi na likhein
