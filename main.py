@@ -900,8 +900,8 @@ Be accurate. If you are not sure about a detail (for example a punishment after 
 An advocate describes this offence or legal issue: {g('topic')}
 Search within: {law}
 Identify the most relevant sections or provisions of Pakistani law that apply: for each give the Act, the section number and a one-line explanation, ranked by relevance. For offences also state the punishment, whether it is bailable or non-bailable, cognizable or non-cognizable, compoundable, and the court of trial. Mention alternative or companion sections that are often invoked together, then add brief practical notes for the advocate.
-Be explicit about anything you are not certain of and never invent section numbers.""", "Dafa search"
-        if not g("section"): raise HTTPException(400, "Dafa / section number likhein.")
+Be explicit about anything you are not certain of and never invent section numbers.""", "Section search"
+        if not g("section"): raise HTTPException(400, "Section number likhein.")
         q = ("Specific question: " + g("question")) if g("question") else ""
         return f"""{LP}
 Explain this provision of Pakistani law for an advocate. Law: {law}. Provision: {g('section')}. {q}
@@ -971,7 +971,7 @@ def ai(r: AiReq, authorization: str = Header(None)):
     if r.kind == "category":      # ek hi list sab ke liye: cache mein ho to free aur foran
         hit = rj(CAT_CACHE, {}).get(ckey)
         if hit and time.time() - hit.get("ts", 0) < 30 * 86400:
-            return {"result": hit["text"], "type": f"Dafaat - {ckey.split('|')[0]}", "used": u.get("prompt_count", 0), "limit": lim, "cached": True}
+            return {"result": hit["text"], "type": f"Sections - {ckey.split('|')[0]}", "used": u.get("prompt_count", 0), "limit": lim, "cached": True}
     if not u.get("is_admin") and lim is not None and u.get("prompt_count", 0) >= lim:
         raise HTTPException(429, f"Aaj ki limit ({lim} prompts) mukammal. Kal reset hogi ya package upgrade karein.")
     if not API_KEY: raise HTTPException(500, "AI service configure nahi hai.")
@@ -1159,6 +1159,7 @@ def admin_cases_ingest(r: CasesAllIn, authorization: str = Header(None)):
     if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
     if len(r.raw) > 3_000_000 or len(r.pdf_b64) > 12_000_000: raise HTTPException(400, "Data bohat bara hai.")
     rows, checked, upd, review = (_pdf_rows(r.pdf_b64) if r.pdf_b64 else cs.parse(r.raw)), 0, 0, 0
+    for x in rows: (x.get("extra") or {}).pop("comments", None)     # the uploading office's own comments never go to other advocates
     for fn in os.listdir(DATA):
         if not fn.endswith("_clients.json"): continue
         path = f"{DATA}/{fn}"; clients = rj(path, [])
@@ -1166,6 +1167,102 @@ def admin_cases_ingest(r: CasesAllIn, authorization: str = Header(None)):
         upd += len(res["updated"]); review += len(res["suggestions"])
         if res["updated"]: wj(path, clients)
     return {"rows": len(rows), "advocates_checked": checked, "clients_updated": upd, "needs_review": review}
+
+BOARD_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Advocate AI - Daily Board</title>
+<style>
+:root{--bg:#f5f7f6;--fg:#14211c;--card:#fff;--line:#c9d6cf;--acc:#0b5d44;--btn:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1a17;--fg:#e6efe9;--card:#16241f;--line:#2c4038;--acc:#3ecf9b;--btn:#06281d}}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+main{max-width:560px;margin:0 auto;padding:20px 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+input,button{font:inherit;padding:10px;border-radius:8px;border:1px solid var(--line);width:100%;box-sizing:border-box;margin:6px 0;background:var(--card);color:var(--fg)}
+button{background:var(--acc);color:var(--btn);border:0;cursor:pointer;font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+label.row{display:flex;gap:8px;align-items:center;margin:8px 0}
+label.row input{width:auto;margin:0}
+pre{white-space:pre-wrap;word-break:break-word;margin:0}
+small{opacity:.75}
+</style></head><body><main>
+<h2>Daily Board upload</h2>
+<div class="card" id="s1">
+  <b>1) Login</b>
+  <input id="id" placeholder="Email" autocomplete="username">
+  <input id="pw" type="password" placeholder="Password" autocomplete="current-password">
+  <button onclick="login()">Login</button>
+  <small>Admin nahi hain to yeh login aap ke kisi purane device ko logout kar sakta hai.</small>
+</div>
+<div class="card" id="s2" hidden>
+  <b>2) Daily Board PDF</b>
+  <input id="f" type="file" accept="application/pdf,.pdf">
+  <label class="row" id="allw" hidden><input id="all" type="checkbox"> Sab advocates ke clients update karein (admin)</label>
+  <button id="go" onclick="send()">Upload aur update</button>
+</div>
+<div class="card" id="out" hidden><pre id="msg"></pre><div id="sg"></div></div>
+<script>
+var T = null;
+function $(i){ return document.getElementById(i); }
+function show(t){ $('out').hidden = false; $('msg').textContent = t; }
+async function api(path, body){
+  var h = {'Content-Type': 'application/json'};
+  if (T) h['Authorization'] = 'Bearer ' + T;
+  var r = await fetch(path, {method: 'POST', headers: h, body: JSON.stringify(body)});
+  var d = {};
+  try { d = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : ('Error ' + r.status));
+  return d;
+}
+async function login(){
+  try {
+    var d = await api('/auth/login', {identifier: $('id').value.trim(), password: $('pw').value});
+    T = d.token; $('s1').hidden = true; $('s2').hidden = false;
+    $('allw').hidden = !(d.user && d.user.is_admin);
+    show('Login ho gaya. Ab PDF chunein.');
+  } catch (e) { show(e.message); }
+}
+function b64(buf){
+  var s = '', a = new Uint8Array(buf);
+  for (var i = 0; i < a.length; i += 32768) s += String.fromCharCode.apply(null, a.subarray(i, i + 32768));
+  return btoa(s);
+}
+async function send(){
+  var f = $('f').files[0];
+  if (!f) { show('Pehle PDF chunein.'); return; }
+  $('go').disabled = true; $('sg').textContent = ''; show('PDF parh raha hoon...');
+  try {
+    var all = $('all').checked && !$('allw').hidden;
+    var d = await api(all ? '/admin/cases/ingest' : '/cases/ingest', {pdf_b64: b64(await f.arrayBuffer())});
+    var t = d.rows + ' cases parhi gayin.\n';
+    if (all) {
+      t += d.advocates_checked + ' advocates check hue, ' + d.clients_updated + ' clients update hue, ' + d.needs_review + ' ki tasdeeq baqi (woh advocate apne account se karega).';
+    } else {
+      t += d.updated.length + ' client update hue, ' + d.suggestions.length + ' ki tasdeeq darkar.';
+      d.updated.forEach(function(u){ t += '\n- ' + u.client + ': ' + u.changes.join(', '); });
+      d.suggestions.forEach(function(s){
+        var div = document.createElement('div'); div.style.marginTop = '10px';
+        var sp = document.createElement('span'); sp.textContent = s.client + ' ? ' + s.why + ' | ' + s.preview;
+        var b = document.createElement('button'); b.textContent = 'Haan, update';
+        b.onclick = async function(){
+          try { await api('/cases/confirm', {client_index: s.client_index, row: s.row}); b.disabled = true; b.textContent = 'Ho gaya'; }
+          catch (e) { show(e.message); }
+        };
+        div.appendChild(sp); div.appendChild(b); $('sg').appendChild(div);
+      });
+    }
+    show(t);
+  } catch (e) { show(e.message); }
+  $('go').disabled = false;
+}
+</script>
+</main></body></html>
+"""
+
+@app.get("/board")
+def board_page():
+    """Upload page for a Daily Board PDF from any PC browser (login, upload, confirm)."""
+    return Response(BOARD_HTML, media_type="text/html; charset=utf-8", headers={"Cache-Control": "no-store"})
 
 # ---------------------------------------------------------------- admin
 @app.get("/admin/users")
