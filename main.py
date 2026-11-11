@@ -245,16 +245,21 @@ from html.parser import HTMLParser
 
 STOP = {"the", "and", "versus", "state", "son", "wife", "daughter", "muhammad", "mohammad", "mst", "mussammat"}
 _MON = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
-_PAIR = re.compile(r"(?<![\d/\-])(\d{1,6})\s*[/\-]\s*(\d{4}|\d{2})(?![\d/\-])")
+_PAIR = re.compile(r"(?<![\d/\-])(\d{1,9})\s*[/\-]\s*(\d{4}|\d{2})(?![\d/\-])")
 
 
 def _year(y):
     y = int(y)
-    return y if y >= 100 else 2000 + y
+    return y if y >= 100 else (2000 + y if 2000 + y <= date.today().year else 1900 + y)
 
 
 def _pairs_of(text):
-    return {(str(int(n)), _year(y)) for n, y in _PAIR.findall(text or "")}
+    """Case/FIR numbers as (number, year): '101/2024', '101/24' and the portal's joined form '205411926' (number + 2-digit year)."""
+    out = {(str(int(n)), _year(y)) for n, y in _PAIR.findall(text or "")}
+    for tok in re.findall(r"(?<![\d/\-])(\d{5,10})(?![\d/\-])", text or ""):
+        y = _year(tok[-2:])
+        if 1990 <= y <= date.today().year and int(tok[:-2]): out.add((str(int(tok[:-2])), y))
+    return out
 
 
 def _tok(s):
@@ -320,6 +325,7 @@ def _row(cells, header):
 def parse(raw):
     """HTML table, or text copied from a table (tab / 3+ spaces / pipe between cells, one row per line)."""
     raw = raw or ""
+    if re.search(r"DAILY\s+DIARY\s+ON", raw, re.I): return board_text_rows(raw)
     if re.search(r"<tr[\s>]", raw, re.I):
         p = _T(); p.feed(raw); rows = p.rows
     else:
@@ -340,7 +346,8 @@ def clean_row(r):
     try: date.fromisoformat(d)
     except ValueError: d = ""
     return {"text": str(r.get("text", ""))[:400], "date": d, "stage": str(r.get("stage", ""))[:80], "court": str(r.get("court", ""))[:80],
-            "ps": str(r.get("ps", ""))[:60], "title": str(r.get("title", ""))[:120], "pairs": sorted([n, y] for n, y in r.get("pairs", []) or [])}
+            "ps": str(r.get("ps", ""))[:60], "title": str(r.get("title", ""))[:120], "pairs": sorted([n, y] for n, y in r.get("pairs", []) or []),
+            "extra": {str(k)[:40]: str(v)[:300] for k, v in (r.get("extra") or {}).items()}}
 
 
 def _score(client, row, hint_ps=""):
@@ -350,6 +357,7 @@ def _score(client, row, hint_ps=""):
         if len(nm) >= 2 and nm <= row.get("tokens", set()): return 50, "naam milta hai magar FIR/case number nahi milta"
         return 0, ""
     s, why = 80, "FIR/case number aur saal milte hain"
+    if any(len(n) >= 5 for n, _ in ids & set(map(tuple, row["pairs"]))): s, why = s + 10, why + ", lamba case number"
     ctext = _nt(" ".join(str(client.get(k, "")) for k in ("fir", "court", "notes", "ps")))
     rps = _nt(row.get("ps") or hint_ps)
     if rps and rps in ctext: s, why = s + 15, why + ", thana bhi"
@@ -358,17 +366,20 @@ def _score(client, row, hint_ps=""):
 
 
 def apply(c, row, today=None):
-    """Update one client from one portal row. Returns a list of human-readable changes."""
-    today, ch, nd = today or date.today().isoformat(), [], row.get("date") or ""
-    if nd and nd >= today and nd != c.get("date"):
-        note = f"[{today}] Agli tareekh: {nd} (court portal) | {c.get('notes', '')}".rstrip(" |")
-        ch.append(f"agli peshi {c.get('date') or '-'} -> {nd}"); c["notes"], c["date"] = note, nd
-    if row.get("stage") and row["stage"] != c.get("stage"): ch.append(f"stage: {row['stage']}"); c["stage"] = row["stage"]
+    """Update one client from one portal row. A board dated in the past never changes the current date or stage."""
+    today, ch, nd, ex = today or date.today().isoformat(), [], row.get("date") or "", row.get("extra") or {}
+    fresh = not nd or nd >= today
+    if nd and nd >= today and nd != c.get("date"): ch.append(f"agli peshi {c.get('date') or '-'} -> {nd}"); c["date"] = nd
+    if row.get("stage") and fresh and row["stage"] != c.get("stage"): ch.append(f"stage: {row['stage']}"); c["stage"] = row["stage"]
     if row.get("court"):
         c["court_portal"] = row["court"]
         if not c.get("court"): c["court"] = row["court"]
+    if ex: c["portal"] = {**ex, "synced": today}          # everything the board shows: parties, U/S, comments, last proceedings...
+    if ch:
+        bits = [f"Agli tareekh: {nd}" if nd and nd >= today else "", f"Stage: {row['stage']}" if row.get("stage") and fresh else "", row.get("court", "")]
+        c["notes"] = f"[{today}] " + " | ".join(x for x in bits if x) + f" (court portal) | {c.get('notes', '')}".rstrip(" |")
     h = c.setdefault("history", [])
-    ent = {"seen": today, "date": nd, "stage": row.get("stage", ""), "src": "dsj.punjab.gov.pk"}
+    ent = {"seen": today, "date": nd, "stage": row.get("stage", ""), "src": "court portal"}
     if not any(isinstance(x, dict) and x.get("date") == nd and x.get("stage") == ent["stage"] for x in h):
         h.append(ent); h[:] = h[-50:]
     c["last_synced"] = datetime.now().isoformat(timespec="minutes")
@@ -379,9 +390,9 @@ def _prev(r):
     return " | ".join(x for x in (r.get("title"), r.get("date"), r.get("stage"), r.get("court")) if x) or r.get("text", "")[:120]
 
 
-def ingest(raw, clients, district="", ps="", today=None):
+def ingest(raw, clients, district="", ps="", today=None, rows=None):
     """Auto-update only when FIR/case number matches AND (thana or name) agrees and no other row ties; else ask the advocate."""
-    rows = parse(raw)
+    rows = rows if rows is not None else parse(raw)
     for r in rows:
         if ps and not r["ps"]: r["ps"] = ps
     updated, sugg, hit = [], [], set()
@@ -430,6 +441,68 @@ def sync_one(client, rows, today=None):
         s, _ = _score(client, r)
         if s >= 80 and (best is None or s > best[0]): best = (s, r)
     return apply(client, best[1], today) if best else None
+
+
+# ---- Daily Board / Daily Diary (the advocate's own board from the portal). Its date is the hearing date of every listed case.
+def _board_date(txt):
+    m = re.search(r"DIARY\s+ON:?\s*(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})", txt or "", re.I)
+    try: return date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat() if m else ""
+    except ValueError: return ""
+
+
+def _board_row(d, group, bdate):
+    g = lambda k: d.get(k, "")
+    cn, first, opp = g("case no.") or g("case no"), g("first party"), g("opposite party")
+    court = g("judge") or g("court") or group
+    pd = _dates(g("previous date")); ex = {"type": g("type"), "case_no": cn, "previous_date": pd[0] if pd else g("previous date"),
+                                           "first_party": first, "opposite_party": opp, "us": g("u/s"), "ps_company": g("p.s/company"),
+                                           "comments": g("comments"), "last_proceedings": g("last proceedings"), "board_date": bdate}
+    return {"text": " | ".join(x for x in (g("type"), cn, court, first, opp, g("stage")) if x)[:400], "pairs": _pairs_of(cn), "date": bdate,
+            "stage": g("stage")[:80], "court": court[:80], "ps": g("p.s/company")[:60], "title": f"{first} v. {opp}".strip(" v.")[:120],
+            "tokens": _tok(f"{first} {opp}"), "extra": {k: v for k, v in ex.items() if v}}      # name matching uses parties only, never the judge
+
+
+def _board_table(t, bdate):
+    group, header, out = "", None, []
+    for raw in t:
+        cells = ["" if re.fullmatch(r"-+", x) else x for x in (re.sub(r"\s+", " ", c or "").strip() for c in raw)]       # '---' = empty
+        if not any(cells): continue
+        low = [c.lower() for c in cells]
+        if "case no." in low or "case no" in low: header = low; continue
+        if header is None: group = next((c for c in cells if c), group); continue          # court title row
+        out.append(_board_row(dict(zip(header, cells)), group, bdate))
+    return [r for r in out if r["pairs"]]
+
+
+def board_rows(pdf_bytes):
+    """Board PDF -> rows with real table cells (stage, judge, parties, comments stay separate). Needs pdfplumber."""
+    try: import pdfplumber
+    except ImportError: raise RuntimeError("Server par pdfplumber install nahi: requirements.txt mein 'pdfplumber' likh kar redeploy karein.")
+    import io
+    out, bdate = [], ""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages[:60]):
+            if i == 0: bdate = _board_date(page.extract_text() or "")
+            for tb in page.extract_tables(): out += _board_table(tb, bdate)
+    return out
+
+
+_HDR = re.compile(r"Type\s+Case\s+No\.?\s+Court\s+No\.?\s+Judge\s+Court\s+Previous\s+Date\s+First\s+Party\s+Opposite\s+Party\s+Stage\s+U/S\s+P\.S/Company\s+Comments\s+Last\s*Proceedings", re.I)
+
+
+def board_text_rows(raw):
+    """Fallback when the board was copied as plain text: case number + hearing date only (stage cannot be separated reliably)."""
+    t = _HDR.sub(" ", re.sub(r"\s+", " ", raw or "")); bdate = _board_date(t)
+    hits = [(m.start(), m.end(), _pairs_of(m.group(0))) for m in re.finditer(r"(?<![\d/\-])\d{1,7}/\d{2,4}(?![\d/\-])|(?<![\d/\-])\d{5,10}(?![\d/\-])", t)]
+    hits = [h for h in hits if h[2]]; out = []
+    for i, (s, e, pairs) in enumerate(hits):
+        seg = t[e:hits[i + 1][0] if i + 1 < len(hits) else len(t)]
+        dm = re.search(r"\d{1,2}-\d{1,2}-\d{4}", seg)
+        parties = seg[dm.end():] if dm else seg                       # drop the judge name that sits before the previous date
+        pd = _dates(dm.group(0)) if dm else []
+        out.append({"text": t[s:e] + " " + parties[:200], "pairs": pairs, "date": bdate, "stage": "", "court": "", "ps": "", "title": "",
+                    "tokens": _tok(parties), "extra": {k: v for k, v in {"previous_date": pd[0] if pd else "", "board_date": bdate}.items() if v}})
+    return out
 ''')      # district court case sync
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -1023,15 +1096,15 @@ def citations_import(r: CitImport, authorization: str = Header(None)):
     return cit.import_text(r.text, r.source)
 
 # ---------------------------------------------------------------- district court case sync
-class CasesIn(BaseModel): raw: str; district: str = ""; ps: str = ""
+class CasesIn(BaseModel): raw: str = ""; pdf_b64: str = ""; district: str = ""; ps: str = ""
 class CasesConfirm(BaseModel): client_index: int; row: dict
 
 @app.post("/cases/ingest")
 def cases_ingest(r: CasesIn, authorization: str = Header(None)):
     _, uid = current(authorization)
-    if len(r.raw) > 600_000: raise HTTPException(400, "Paste kiya hua text bohat bara hai.")
+    if len(r.raw) > 600_000 or len(r.pdf_b64) > 12_000_000: raise HTTPException(400, "Data bohat bara hai.")
     path = dpath(uid, "clients"); clients = rj(path, [])
-    res = cs.ingest(r.raw, clients, r.district, r.ps)
+    res = cs.ingest(r.raw, clients, r.district, r.ps, rows=_pdf_rows(r.pdf_b64) if r.pdf_b64 else None)
     if res["updated"]: wj(path, clients)
     return res
 
@@ -1068,6 +1141,31 @@ def _court_poller():
 @app.on_event("startup")
 def _start_court_poller():
     if COURT_API_URL: threading.Thread(target=_court_poller, daemon=True).start()
+
+def _pdf_rows(b64):
+    """Daily Board PDF (the advocate's own board) -> rows with real table cells."""
+    import base64
+    try: return cs.board_rows(base64.b64decode(b64))
+    except RuntimeError as e: raise HTTPException(501, str(e))
+    except Exception: raise HTTPException(400, "PDF parh nahi saka. Daily Board PDF dobara chunein.")
+
+class CasesAllIn(BaseModel): raw: str = ""; pdf_b64: str = ""
+
+@app.post("/admin/cases/ingest")
+def admin_cases_ingest(r: CasesAllIn, authorization: str = Header(None)):
+    """Admin solves the portal's check himself and pastes the result (or uploads a board PDF) once; every advocate's clients that
+    match with high confidence are updated. The admin never sees other advocates' client names, only counts."""
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    if len(r.raw) > 3_000_000 or len(r.pdf_b64) > 12_000_000: raise HTTPException(400, "Data bohat bara hai.")
+    rows, checked, upd, review = (_pdf_rows(r.pdf_b64) if r.pdf_b64 else cs.parse(r.raw)), 0, 0, 0
+    for fn in os.listdir(DATA):
+        if not fn.endswith("_clients.json"): continue
+        path = f"{DATA}/{fn}"; clients = rj(path, [])
+        res = cs.ingest("", clients, rows=rows); checked += 1
+        upd += len(res["updated"]); review += len(res["suggestions"])
+        if res["updated"]: wj(path, clients)
+    return {"rows": len(rows), "advocates_checked": checked, "clients_updated": upd, "needs_review": review}
 
 # ---------------------------------------------------------------- admin
 @app.get("/admin/users")
