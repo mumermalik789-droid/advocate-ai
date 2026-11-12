@@ -350,7 +350,27 @@ def clean_row(r):
             "extra": {str(k)[:40]: str(v)[:300] for k, v in (r.get("extra") or {}).items()}}
 
 
+DISTRICTS = ["Attock", "Bahawalnagar", "Bahawalpur", "Bhakkar", "Chakwal", "Chiniot", "Dera Ghazi Khan", "Faisalabad", "Gujranwala", "Gujrat", "Hafizabad",
+             "Jhang", "Jhelum", "Kasur", "Khanewal", "Khushab", "Lahore", "Layyah", "Lodhran", "Mandi Bahauddin", "Mianwali", "Multan", "Muzaffargarh",
+             "Narowal", "Nankana Sahib", "Okara", "Pakpattan", "Rahim Yar Khan", "Rajanpur", "Rawalpindi", "Sahiwal", "Sargodha", "Sheikhupura", "Sialkot",
+             "Toba Tek Singh", "Vehari"]
+
+
+def district_in(text):
+    t = f" {_nt(text)} "
+    for d in sorted(DISTRICTS, key=len, reverse=True):
+        if f" {_nt(d)} " in t: return d
+    return ""
+
+
+def district_of(client):
+    """Client's district: the 'district' field, else a district name typed in 'court'. '' if unknown."""
+    return district_in(client.get("district", "")) or district_in(client.get("court", ""))
+
+
 def _score(client, row, hint_ps=""):
+    cd, rd = district_of(client), district_in(row.get("court", ""))
+    if cd and rd and cd != rd and "high court" not in row.get("court", "").lower(): return 0, ""       # same number, different city = different case
     ids = _pairs_of(f"{client.get('fir', '')} {client.get('case_no', '')}")
     nm = _tok(client.get("name", ""))
     if not (ids & set(map(tuple, row["pairs"]))):
@@ -369,7 +389,9 @@ def apply(c, row, today=None):
     """Update one client from one portal row. A board dated in the past never changes the current date or stage."""
     today, ch, nd, ex = today or date.today().isoformat(), [], row.get("date") or "", row.get("extra") or {}
     fresh = not nd or nd >= today
-    if nd and nd >= today and nd != c.get("date"): ch.append(f"agli peshi {c.get('date') or '-'} -> {nd}"); c["date"] = nd
+    if nd and nd >= today and nd != c.get("date"):
+        ch.append(f"agli peshi {c.get('date') or '-'} -> {nd}"); c["date"] = nd
+        c["notify"] = {"date": nd, "stage": row.get("stage", ""), "court": row.get("court", ""), "created": today}      # app offers to message the client
     if row.get("stage") and fresh and row["stage"] != c.get("stage"): ch.append(f"stage: {row['stage']}"); c["stage"] = row["stage"]
     if row.get("court"):
         c["court_portal"] = row["court"]
@@ -503,6 +525,31 @@ def board_text_rows(raw):
         out.append({"text": t[s:e] + " " + parties[:200], "pairs": pairs, "date": bdate, "stage": "", "court": "", "ps": "", "title": "",
                     "tokens": _tok(parties), "extra": {k: v for k, v in {"previous_date": pd[0] if pd else "", "board_date": bdate}.items() if v}})
     return out
+
+
+def fetch_causelist(url, key, district, day, timeout=30):
+    """Official bulk feed: every court of one district for one day in a single request. Same JSON rows as fetch_official."""
+    q = urllib.parse.urlencode({"district": district, "date": day})
+    req = urllib.request.Request(f"{url}?{q}", headers={"X-Api-Key": key, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp: data = json.loads(resp.read().decode("utf-8"))
+    rows = rows_from_json(data.get("rows") if isinstance(data, dict) else data)
+    for r in rows: r["date"] = r["date"] or day            # a cause list's date is the hearing date of its rows
+    return rows
+
+
+def sweep_causelist(data, fetch, days, today=None):
+    """data: {file: [clients]}. Asks the feed once per district per day (all courts of that city), updates every advocate's
+    matching clients, returns the set of files that changed. Clients without a district (field or city in 'court') are skipped."""
+    districts = sorted({district_of(c) for cl in data.values() for c in cl if isinstance(c, dict)} - {""})
+    changed = set()
+    for d in districts:
+        for day in sorted(days, reverse=True):            # earliest day is applied last, so the earliest hearing wins
+            try: rows = fetch(d, day)
+            except Exception as e:
+                print(f"[court] cause list {d} {day}: {type(e).__name__}", flush=True); continue
+            for name, cl in data.items():
+                if ingest("", cl, rows=rows, today=today)["updated"]: changed.add(name)
+    return changed
 ''')      # district court case sync
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -1119,7 +1166,18 @@ def cases_confirm(r: CasesConfirm, authorization: str = Header(None)):
 # Full automation switch: only if PITB / D&SJ grants an official feed (set COURT_API_URL and COURT_API_KEY on the server).
 COURT_API_URL, COURT_API_KEY = os.environ.get("COURT_API_URL", ""), os.environ.get("COURT_API_KEY", "")
 
+def _court_poll_causelist():
+    """COURT_FEED_MODE=causelist: one feed request per district per day (all courts of that city), then update every advocate's clients."""
+    import datetime as dt
+    days = [(dt.date.today() + dt.timedelta(days=i)).isoformat() for i in range(max(1, int(os.environ.get("COURT_DAYS_AHEAD", "3"))))]
+    data = {fn: rj(f"{DATA}/{fn}", []) for fn in os.listdir(DATA) if fn.endswith("_clients.json")}
+    def fetch(d, day):
+        time.sleep(1)
+        return cs.fetch_causelist(COURT_API_URL, COURT_API_KEY, d, day)
+    for fn in cs.sweep_causelist(data, fetch, days): wj(f"{DATA}/{fn}", data[fn])
+
 def _court_poll_once():
+    if os.environ.get("COURT_FEED_MODE", "case") == "causelist": return _court_poll_causelist()
     for fn in os.listdir(DATA):
         if not fn.endswith("_clients.json"): continue
         path, changed = f"{DATA}/{fn}", False
@@ -1168,6 +1226,21 @@ def admin_cases_ingest(r: CasesAllIn, authorization: str = Header(None)):
         if res["updated"]: wj(path, clients)
     return {"rows": len(rows), "advocates_checked": checked, "clients_updated": upd, "needs_review": review}
 
+@app.post("/admin/cases/districts")
+def admin_cases_districts(authorization: str = Header(None)):
+    """Admin: how many clients (with a case number) are in each district, so he knows whose cause list is worth uploading.
+    Counts only: no client or advocate names."""
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    counts = {}
+    for fn in os.listdir(DATA):
+        if not fn.endswith("_clients.json"): continue
+        for c in rj(f"{DATA}/{fn}", []):
+            if not isinstance(c, dict) or not cs._pairs_of(f"{c.get('fir', '')} {c.get('case_no', '')}"): continue
+            d = cs.district_of(c) or (c.get("district") or "").strip().title() or "Ghair maloom"
+            e = counts.setdefault(d, [0, set()]); e[0] += 1; e[1].add(fn)
+    return {"districts": sorted(({"district": d, "clients": v[0], "advocates": len(v[1])} for d, v in counts.items()), key=lambda x: -x["clients"])}
+
 BOARD_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Advocate AI - Daily Board</title>
@@ -1200,6 +1273,11 @@ small{opacity:.75}
   <label class="row" id="allw" hidden><input id="all" type="checkbox"> Sab advocates ke clients update karein (admin)</label>
   <button id="go" onclick="send()">Upload aur update</button>
 </div>
+<div class="card" id="s3" hidden>
+  <b>Districts</b> <small>(admin)</small>
+  <button onclick="districts()">Kis district ke kitne clients hain</button>
+  <pre id="dist"></pre>
+</div>
 <div class="card" id="out" hidden><pre id="msg"></pre><div id="sg"></div></div>
 <script>
 var T = null;
@@ -1219,7 +1297,14 @@ async function login(){
     var d = await api('/auth/login', {identifier: $('id').value.trim(), password: $('pw').value});
     T = d.token; $('s1').hidden = true; $('s2').hidden = false;
     $('allw').hidden = !(d.user && d.user.is_admin);
+    $('s3').hidden = $('allw').hidden;
     show('Login ho gaya. Ab PDF chunein.');
+  } catch (e) { show(e.message); }
+}
+async function districts(){
+  try {
+    var d = await api('/admin/cases/districts', {});
+    $('dist').textContent = d.districts.length ? d.districts.map(function(x){ return x.district + ': ' + x.clients + ' clients (' + x.advocates + ' advocates)'; }).join('\n') : 'Abhi koi client nahi.';
   } catch (e) { show(e.message); }
 }
 function b64(buf){
