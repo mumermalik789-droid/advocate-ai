@@ -239,11 +239,12 @@ dsj.punjab.gov.pk asks a human arithmetic question before every search, and this
 Flow: the advocate searches on the portal himself, copies the result table and pastes it into the app -> parse ->
 match to his clients -> update. If PITB / D&SJ ever grants an official feed, fetch_official() + sync_one() reuse the
 same matching, so full automation is a configuration change (COURT_API_URL / COURT_API_KEY), not a rewrite."""
-import json, re, urllib.parse, urllib.request
+import copy, json, re, urllib.parse, urllib.request
 from datetime import date, datetime
 from html.parser import HTMLParser
 
-STOP = {"the", "and", "versus", "state", "son", "wife", "daughter", "muhammad", "mohammad", "mst", "mussammat"}
+STOP = {"the", "and", "versus", "state", "son", "wife", "daughter", "muhammad", "mohammad", "mst", "mussammat",
+        "etc", "others", "ors", "govt", "government", "province", "punjab", "pakistan", "federation"}      # too common to prove a match
 _MON = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
 _PAIR = re.compile(r"(?<![\d/\-])(\d{1,9})\s*[/\-]\s*(\d{4}|\d{2})(?![\d/\-])")
 
@@ -262,8 +263,25 @@ def _pairs_of(text):
     return out
 
 
+# ---- Urdu helpers: matching only (the court's own spelling is what gets stored)
+_UR_MAP = {0x64A: "ی", 0x649: "ی", 0x643: "ک", 0x647: "ہ", 0x6C3: "ہ", 0x6D3: "ے", 0x200C: None, 0x200D: None}
+_UR_MAP.update({0x660 + i: 48 + i for i in range(10)}); _UR_MAP.update({0x6F0 + i: 48 + i for i in range(10)})
+_DIG = {k: v for k, v in _UR_MAP.items() if isinstance(v, int)}
+
+
+def _ur(s): return (s or "").translate(_UR_MAP)
+
+
+def _dg(s): return (s or "").translate(_DIG)          # Arabic/Persian digits -> 0-9, text untouched
+
+
+STOP_UR = {_ur(w) for w in ("بنام", "وغیرہ", "وغیر", "سرکار", "صوبہ", "پنجاب", "مسماۃ", "مسمات", "بیگم", "محمد", "ریاست")}
+
+
 def _tok(s):
-    return {t for t in re.findall(r"[a-z]{3,}", (s or "").lower()) if t not in STOP}
+    s = s or ""
+    return ({t for t in re.findall(r"[a-z]{3,}", s.lower()) if t not in STOP}
+            | {t for t in re.findall(r"[\u0600-\u06FF]{3,}", _ur(s)) if t not in STOP_UR})
 
 
 def _nt(s):
@@ -322,10 +340,136 @@ def _row(cells, header):
     return r
 
 
+# ---- Urdu district-court cause list ("فہرست مقدمات مورخہ ...") copied as text from the court's page
+_URD = {_ur(k).replace(" ", ""): v for k, v in {
+    "سیالکوٹ": "Sialkot", "لاہور": "Lahore", "گوجرانوالہ": "Gujranwala", "فیصل آباد": "Faisalabad", "ملتان": "Multan",
+    "راولپنڈی": "Rawalpindi", "سرگودھا": "Sargodha", "بہاولپور": "Bahawalpur", "شیخوپورہ": "Sheikhupura", "قصور": "Kasur",
+    "ساہیوال": "Sahiwal", "اوکاڑہ": "Okara", "گجرات": "Gujrat", "جہلم": "Jhelum", "چکوال": "Chakwal", "اٹک": "Attock",
+    "منڈی بہاؤالدین": "Mandi Bahauddin", "حافظ آباد": "Hafizabad", "نارووال": "Narowal", "ڈیرہ غازی خان": "Dera Ghazi Khan",
+    "مظفرگڑھ": "Muzaffargarh", "لیہ": "Layyah", "راجن پور": "Rajanpur", "رحیم یار خان": "Rahim Yar Khan",
+    "بہاولنگر": "Bahawalnagar", "لودھراں": "Lodhran", "خانیوال": "Khanewal", "وہاڑی": "Vehari", "پاکپتن": "Pakpattan",
+    "جھنگ": "Jhang", "چنیوٹ": "Chiniot", "ٹوبہ ٹیک سنگھ": "Toba Tek Singh", "بھکر": "Bhakkar", "میانوالی": "Mianwali",
+    "خوشاب": "Khushab", "ننکانہ صاحب": "Nankana Sahib"}.items()}
+# ---- English labels (clients are kept in English): court's own Urdu text stays in extra["*_ur"]
+def _key(s): return _ur(s).replace(" ", "")
+
+
+def _rule(rules, text, default=None):
+    k = _key(text)
+    for words, en in rules:
+        if all(_key(w) in k for w in words): return en
+    return text if default is None else default
+
+
+_STAGE_RULES = [(("ابتدائی", "بحث"), "Preliminary arguments"), (("بحث",), "For arguments"), (("طلبی",), "Summoning of witnesses"),
+                (("شہادت",), "For evidence"), (("وکالت",), "Filing of vakalatnama"), (("مثل",), "Along with other file"),
+                (("ضمانت",), "For filing of surety bond"), (("اشتہار",), "Ishtehar (publication of notice)"), (("نوٹس",), "Notice")]
+_TYPE_RULES = [(("ضمانت", "گرفتاری"), "Pre-arrest bail application"), (("22",), "Application u/s 22-A/B Cr.P.C (registration of FIR)"),
+               (("ریپ",), "Anti-rape cases"), (("اغوا",), "Other sessions cases (abduction, 365-B PPC)"), (("فیملی",), "Family appeal"),
+               (("بحالی",), "Restoration application (appeal / suit / revision / application)"),
+               (("دیوانی", "درمیانی"), "Civil appeal against interim order"), (("دیوانی", "آخیر"), "Civil appeal against final order"),
+               (("نگرانی",), "Civil revision"), (("37",), "Suit under Order XXXVII CPC"), (("متفرق",), "Civil miscellaneous")]
+_PS_EN = [(_key(k), v) for k, v in (
+    ("نیکاپورہ", ("Nikapura", "Nekapura", "Neka Pura", "Nikka Pura")), ("کوتوالی", ("Kotwali", "Kotwali Sialkot")),
+    ("رنگ پورہ", ("Rangpura", "Rang Pura")), ("مرادپور", ("Muradpur", "Murad Pur", "Moradpur")),
+    ("کوٹلی سید امیر", ("Kotli Syed Amir", "Kotli Sayed Amir", "Kotli Syed Ameer", "Kotli Sayyed Amir")),
+    ("سمبڑیال", ("Sambrial",)), ("ڈسکہ", ("Daska",)), ("پسرور", ("Pasrur",)), ("چونڈہ", ("Chawinda", "Chawnda")),
+    ("بیگووالہ", ("Begowala", "Begowal")), ("اگوکی", ("Ugoke",)), ("بڈیانہ", ("Badiana",)), ("کینٹ", ("Cantt", "Cantonment")),
+    ("سول لائن", ("Civil Lines",)))]
+
+
+def _ps_en(s):
+    k = _key(s)
+    for key, names in _PS_EN:
+        if key in k: return names[0], list(names[1:])
+    return s, []
+
+
+def _judge_en(judge_ln):
+    """'Additional District & Sessions Judge <name>' when the designation is recognised, else the court's own Urdu line."""
+    k = _key(judge_ln)
+    nm = re.search(r"^جناب\s*(.*?)\s*صاحب", judge_ln)
+    desig = ("Additional District & Sessions Judge" if "ایڈیشنل" in k and "سیشن" in k else
+             "Senior Civil Judge" if "سینئرسول" in k else "Civil Judge" if "سولجج" in k else
+             "District & Sessions Judge" if "ڈسٹرکٹ" in k and "سیشن" in k else "")
+    return f"{desig} {nm.group(1)}".strip() if desig and nm else ""
+
+
+_UR_C = re.compile(r"^(\d{1,2}[./-]\d{1,2}[./-]\d{4})\s+(\d{5,10})\s+(\d{1,4})$")
+_UR_FIR = re.compile(r"^\d{1,6}\s*/\s*\d{4}$")
+
+
+def _urdu_district(text):
+    t = _ur(text).replace(" ", "")
+    for k in sorted(_URD, key=len, reverse=True):
+        if k in t: return _URD[k]
+    return ""
+
+
+def is_urdu_list(raw):
+    t = _dg(raw or "")
+    return bool(re.search(r"[\u0600-\u06FF]{3}", t) and re.search(r"^\s*\d{1,2}[./-]\d{1,2}[./-]\d{4}\s+\d{5,10}\s+\d{1,4}\s*$", t, re.M))
+
+
+def _ur_row(cur, m, sec, ldate, court):
+    cells, (inst, cno, serial) = cur["cells"], m.groups()
+    ti = next((i for i, c in enumerate(cells) if "بنام" in _ur(c)), 1 if len(cells) > 1 else 0)
+    title = cells[ti] if cells else ""
+    pre, post = cells[:ti], cells[ti + 1:]
+    nd = next((d for c in pre for d in _dates(c)[:1]), "")                 # next date, if the court already filled it in
+    words = [c for c in pre if not _dates(c)]
+    today_stage, next_stage = (words[-1] if words else ""), (words[-2] if len(words) > 1 else "")
+    fir = next((c for c in post if _UR_FIR.match(c)), "")
+    parts = re.split(r"\s*بنام\s*", title, maxsplit=1); first, opp = parts[0], (parts[1] if len(parts) > 1 else "")
+    date_, stage = (nd, next_stage) if nd else (ldate, today_stage)           # no next date yet: the list's own day is the hearing
+    stage_ur, sec_ur = stage, sec
+    stage, sec = _rule(_STAGE_RULES, stage), _rule(_TYPE_RULES, sec)
+    ps_en, ps_alias = _ps_en(cur["ps"])
+    ex = {"type": sec, "case_no": cno, "first_party": first.strip(), "opposite_party": opp.strip(), "us": ", ".join(c for c in post if c != fir),
+          "ps_company": ps_en, "board_date": ldate, "registered": (_dates(inst) or [""])[0], "serial_no": serial,
+          "stage_ur": stage_ur if stage_ur != stage else "", "type_ur": sec_ur if sec_ur != sec else "", "ps_ur": cur["ps"] if cur["ps"] != ps_en else ""}
+    return {"text": f"{title} | {fir or cno} | {stage}"[:400], "pairs": _pairs_of(cno) | (_pairs_of(fir) if fir else set()), "date": date_,
+            "stage": stage[:80], "court": court[:80], "ps": ps_en[:60], "ps_alias": ps_alias, "title": title[:120], "tokens": _tok(f"{first} {opp}"), "listed": not nd,
+            "extra": {k: v for k, v in ex.items() if v}}
+
+
+def urdu_list_rows(raw):
+    """One case = 1-3 lines: [stage, title, sections, FIR] / [police station] / [institution date, case number, serial].
+    The list's own date is the hearing date; a next date is used instead only when the court has already filled it in."""
+    lines = [ln.strip() for ln in _dg(raw).replace("\r", "").split("\n") if ln.strip()]
+    skip, ldate, court_ln, judge_ln = set(), "", "", ""
+    for i, ln in enumerate(lines[:10]):
+        n = _ur(ln)
+        if "نمبرشمار" in n.replace(" ", ""): skip.add(i)                      # column header
+        elif "مورخ" in n and "فہرست" in n: ldate = (_dates(ln) or [""])[0]; skip.add(i)
+        elif i < 3 and not court_ln and ("کورٹ" in n or "عدالت" in n): court_ln = ln; skip.add(i)
+        elif i < 4 and not judge_ln and ("جج" in n or ln.startswith("جناب")): judge_ln = ln; skip.add(i)
+    dist = _urdu_district(court_ln) or _urdu_district(judge_ln)                # Latin district name so the same-city check in _score works
+    judge = re.sub(r"^جناب\s*", "", judge_ln).replace(" صاحب", "").strip()
+    judge = _judge_en(judge_ln) or judge
+    court = " - ".join(x for x in (dist, judge or court_ln) if x)
+    out, sec, cur = [], "", None
+    for i, ln in enumerate(lines):
+        if i in skip: continue
+        m = _UR_C.match(re.sub(r"\s+", " ", ln))
+        if m:
+            if cur: out.append(_ur_row(cur, m, sec, ldate, court))
+            cur = None; continue
+        cells = [c for c in (x.strip(" \u200c\u200d") for x in re.split(r"\t+|\s{3,}", ln)) if c]
+        if "بنام" in _ur(ln) or len(cells) >= 2: cur = {"cells": cells, "ps": ""}
+        elif cur is not None:
+            if not cur["ps"]: cur["ps"] = ln
+        else: sec = ln                                                             # category heading (family appeal, civil revision, ...)
+    return out
+
+
 def parse(raw):
     """HTML table, or text copied from a table (tab / 3+ spaces / pipe between cells, one row per line)."""
     raw = raw or ""
     if re.search(r"DAILY\s+DIARY\s+ON", raw, re.I): return board_text_rows(raw)
+    if is_urdu_list(raw):
+        rows = urdu_list_rows(raw)
+        if rows: return rows
     if re.search(r"<tr[\s>]", raw, re.I):
         p = _T(); p.feed(raw); rows = p.rows
     else:
@@ -379,15 +523,19 @@ def _score(client, row, hint_ps=""):
     s, why = 80, "FIR/case number aur saal milte hain"
     if any(len(n) >= 5 for n, _ in ids & set(map(tuple, row["pairs"]))): s, why = s + 10, why + ", lamba case number"
     ctext = _nt(" ".join(str(client.get(k, "")) for k in ("fir", "court", "notes", "ps")))
-    rps = _nt(row.get("ps") or hint_ps)
-    if rps and rps in ctext: s, why = s + 15, why + ", thana bhi"
-    if nm and nm & row.get("tokens", set()): s, why = s + 10, why + ", naam bhi"
+    cands = [_nt(row.get("ps") or hint_ps)] + [_nt(a) for a in row.get("ps_alias", [])]
+    if any(a and (a in ctext or a.replace(" ", "") in ctext.replace(" ", "")) for a in cands): s, why = s + 15, why + ", thana bhi"
+    parties = _tok(" ".join(str(client.get(k, "")) for k in ("name", "first_party", "opposite_party")))
+    if parties & row.get("tokens", set()): s, why = s + 10, why + ", naam/party bhi"
+    ct, rt = _tok(client.get("case_type", "")), _tok((row.get("extra") or {}).get("type", ""))
+    if ct and rt and ct & rt: s, why = s + 5, why + ", case ki type bhi"          # a hint only: never enough alone for a short number
     return s, why
 
 
 def apply(c, row, today=None):
     """Update one client from one portal row. A board dated in the past never changes the current date or stage."""
     today, ch, nd, ex = today or date.today().isoformat(), [], row.get("date") or "", row.get("extra") or {}
+    if row.get("listed") and nd == today and str(c.get("date") or "") > today: return ch      # today's list never pulls back a later date the advocate/court already set
     fresh = not nd or nd >= today
     if nd and nd >= today and nd != c.get("date"):
         ch.append(f"agli peshi {c.get('date') or '-'} -> {nd}"); c["date"] = nd
@@ -396,7 +544,13 @@ def apply(c, row, today=None):
     if row.get("court"):
         c["court_portal"] = row["court"]
         if not c.get("court"): c["court"] = row["court"]
-    if ex: c["portal"] = {**ex, "synced": today}          # everything the board shows: parties, U/S, comments, last proceedings...
+    if ex:
+        c["portal"] = {**ex, "synced": today}
+        for ck, ek in (("case_type", "type"), ("first_party", "first_party"), ("opposite_party", "opposite_party")):
+            if ex.get(ek) and not c.get(ck): c[ck] = ex[ek]                    # fill what the advocate left empty, never overwrite
+        if fresh:
+            if ex.get("previous_date"): c["prev_date"] = ex["previous_date"]
+            if ex.get("last_proceedings"): c["last_proceedings"] = ex["last_proceedings"]          # everything the board shows: parties, U/S, comments, last proceedings...
     if ch:
         bits = [f"Agli tareekh: {nd}" if nd and nd >= today else "", f"Stage: {row['stage']}" if row.get("stage") and fresh else "", row.get("court", "")]
         c["notes"] = f"[{today}] " + " | ".join(x for x in bits if x) + f" (court portal) | {c.get('notes', '')}".rstrip(" |")
@@ -412,9 +566,21 @@ def _prev(r):
     return " | ".join(x for x in (r.get("title"), r.get("date"), r.get("stage"), r.get("court")) if x) or r.get("text", "")[:120]
 
 
+def _collapse(rows, today):
+    """The same case listed on several dates (a range board): keep the earliest hearing still ahead, else the latest."""
+    best, out = {}, []
+    for r in rows:
+        if not r["pairs"]: out.append(r); continue
+        k, o = (frozenset(map(tuple, r["pairs"])), r.get("title", "")), best.get((frozenset(map(tuple, r["pairs"])), r.get("title", "")))
+        a, b = (o or {}).get("date") or "", r.get("date") or ""
+        af, bf = bool(a) and a >= today, bool(b) and b >= today
+        if o is None or (bf and not af) or (bf and af and b < a) or (not af and not bf and b > a): best[k] = r
+    return out + list(best.values())
+
+
 def ingest(raw, clients, district="", ps="", today=None, rows=None):
     """Auto-update only when FIR/case number matches AND (thana or name) agrees and no other row ties; else ask the advocate."""
-    rows = rows if rows is not None else parse(raw)
+    rows = _collapse(rows if rows is not None else parse(raw), today or date.today().isoformat())
     for r in rows:
         if ps and not r["ps"]: r["ps"] = ps
     updated, sugg, hit = [], [], set()
@@ -427,7 +593,7 @@ def ingest(raw, clients, district="", ps="", today=None, rows=None):
         else:
             sugg.append({"client_index": i, "client": c.get("name", ""), "preview": _prev(rows[k]), "row": clean_row(rows[k]),
                          "why": why + (" (aik se ziyada rows milti hain)" if tie else "")})
-    return {"rows": len(rows), "updated": updated, "suggestions": sugg, "unmatched_rows": max(0, len(rows) - len(hit))}
+    return {"rows": len(rows), "dated": any(r.get("date") for r in rows), "updated": updated, "suggestions": sugg, "unmatched_rows": max(0, len(rows) - len(hit))}
 
 
 # ---- official feed (only if PITB / D&SJ grants one). Expected JSON: {"rows":[{"fir_no","fir_year","case_no","case_year",
@@ -467,9 +633,26 @@ def sync_one(client, rows, today=None):
 
 # ---- Daily Board / Daily Diary (the advocate's own board from the portal). Its date is the hearing date of every listed case.
 def _board_date(txt):
-    m = re.search(r"DIARY\s+ON:?\s*(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})", txt or "", re.I)
-    try: return date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat() if m else ""
-    except ValueError: return ""
+    """Hearing date of the board: 'DAILY DIARY ON: dd-mm-yyyy', or 'Cause List / Board / Hearing Date: dd-mm-yyyy'. Never the 'Report Generated On' date."""
+    for rx in (r"DIARY\s+ON:?", r"(?:CAUSE\s*LIST|BOARD|LISTING|HEARING)\s*(?:DATE|FOR|ON)?:?"):
+        m = re.search(rx + r"\s*(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})", txt or "", re.I)
+        if m:
+            try: return date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat()
+            except ValueError: pass
+    return ""
+
+
+# Other software names the same columns differently: map the common synonyms to the names the parser uses.
+_H = [("case no.", r"case\s*(no|number|#|id)|suit\s*no|^cnr"), ("first party", r"first\s*party|petitioner|plaintiff|appellant|applicant|complainant"),
+      ("opposite party", r"opposite\s*party|respondent|defendant|accused"), ("stage", r"^(stage|status|purpose|business)\b"),
+      ("judge", r"^(judge|presiding)"), ("court", r"^court\b(?!\s*no)"), ("previous date", r"previous\s*date|last\s*date"),
+      ("hearing date", r"next\s*(date|hearing)|hearing\s*date|date\s*of\s*hearing|fixed\s*for")]
+
+
+def _canon(h):
+    for k, rx in _H:
+        if re.search(rx, h, re.I): return k
+    return h
 
 
 def _board_row(d, group, bdate):
@@ -479,7 +662,7 @@ def _board_row(d, group, bdate):
     pd = _dates(g("previous date")); ex = {"type": g("type"), "case_no": cn, "previous_date": pd[0] if pd else g("previous date"),
                                            "first_party": first, "opposite_party": opp, "us": g("u/s"), "ps_company": g("p.s/company"),
                                            "comments": g("comments"), "last_proceedings": g("last proceedings"), "board_date": bdate}
-    return {"text": " | ".join(x for x in (g("type"), cn, court, first, opp, g("stage")) if x)[:400], "pairs": _pairs_of(cn), "date": bdate,
+    return {"text": " | ".join(x for x in (g("type"), cn, court, first, opp, g("stage")) if x)[:400], "pairs": _pairs_of(cn), "date": (_dates(g("hearing date")) or [bdate])[0],
             "stage": g("stage")[:80], "court": court[:80], "ps": g("p.s/company")[:60], "title": f"{first} v. {opp}".strip(" v.")[:120],
             "tokens": _tok(f"{first} {opp}"), "extra": {k: v for k, v in ex.items() if v}}      # name matching uses parties only, never the judge
 
@@ -489,24 +672,26 @@ def _board_table(t, bdate):
     for raw in t:
         cells = ["" if re.fullmatch(r"-+", x) else x for x in (re.sub(r"\s+", " ", c or "").strip() for c in raw)]       # '---' = empty
         if not any(cells): continue
-        low = [c.lower() for c in cells]
-        if "case no." in low or "case no" in low: header = low; continue
+        low = [_canon(c.lower()) for c in cells]
+        if "case no." in low: header = low; continue
         if header is None: group = next((c for c in cells if c), group); continue          # court title row
         out.append(_board_row(dict(zip(header, cells)), group, bdate))
     return [r for r in out if r["pairs"]]
 
 
 def board_rows(pdf_bytes):
-    """Board PDF -> rows with real table cells (stage, judge, parties, comments stay separate). Needs pdfplumber."""
+    """Board PDF -> rows with real table cells (stage, judge, parties, comments stay separate). Needs pdfplumber.
+    If no table with a case-number column is found, falls back to reading the text (case number + date only)."""
     try: import pdfplumber
     except ImportError: raise RuntimeError("Server par pdfplumber install nahi: requirements.txt mein 'pdfplumber' likh kar redeploy karein.")
     import io
-    out, bdate = [], ""
+    out, texts, bdate = [], [], ""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i, page in enumerate(pdf.pages[:60]):
-            if i == 0: bdate = _board_date(page.extract_text() or "")
+            tx = page.extract_text() or ""; texts.append(tx)
+            bdate = _board_date(tx) or bdate               # a range board has a new date heading on each day's pages
             for tb in page.extract_tables(): out += _board_table(tb, bdate)
-    return out
+    return out or board_text_rows("\n".join(texts))
 
 
 _HDR = re.compile(r"Type\s+Case\s+No\.?\s+Court\s+No\.?\s+Judge\s+Court\s+Previous\s+Date\s+First\s+Party\s+Opposite\s+Party\s+Stage\s+U/S\s+P\.S/Company\s+Comments\s+Last\s*Proceedings", re.I)
@@ -550,6 +735,20 @@ def sweep_causelist(data, fetch, days, today=None):
             for name, cl in data.items():
                 if ingest("", cl, rows=rows, today=today)["updated"]: changed.add(name)
     return changed
+
+
+# ---- admin safety net: remember exactly what a bulk update changed, and put it back only where nobody edited since
+def changed_entries(before, after):
+    return [{"i": i, "before": b, "after": copy.deepcopy(a)} for i, (b, a) in enumerate(zip(before, after)) if b != a]
+
+
+def undo_entries(clients, entries):
+    done = skipped = 0
+    for e in entries:
+        i = e["i"]
+        if 0 <= i < len(clients) and clients[i] == e["after"]: clients[i] = e["before"]; done += 1
+        else: skipped += 1                       # edited by the advocate (or the list changed) after the sync: leave it alone
+    return done, skipped
 ''')      # district court case sync
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -1207,7 +1406,7 @@ def _pdf_rows(b64):
     except RuntimeError as e: raise HTTPException(501, str(e))
     except Exception: raise HTTPException(400, "PDF parh nahi saka. Daily Board PDF dobara chunein.")
 
-class CasesAllIn(BaseModel): raw: str = ""; pdf_b64: str = ""
+class CasesAllIn(BaseModel): raw: str = ""; pdf_b64: str = ""; dry: bool = False
 
 @app.post("/admin/cases/ingest")
 def admin_cases_ingest(r: CasesAllIn, authorization: str = Header(None)):
@@ -1216,15 +1415,34 @@ def admin_cases_ingest(r: CasesAllIn, authorization: str = Header(None)):
     users, uid = current(authorization)
     if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
     if len(r.raw) > 3_000_000 or len(r.pdf_b64) > 12_000_000: raise HTTPException(400, "Data bohat bara hai.")
-    rows, checked, upd, review = (_pdf_rows(r.pdf_b64) if r.pdf_b64 else cs.parse(r.raw)), 0, 0, 0
+    import copy
+    rows, checked, upd, review, batch = (_pdf_rows(r.pdf_b64) if r.pdf_b64 else cs.parse(r.raw)), 0, 0, 0, []
     for x in rows: (x.get("extra") or {}).pop("comments", None)     # the uploading office's own comments never go to other advocates
     for fn in os.listdir(DATA):
         if not fn.endswith("_clients.json"): continue
-        path = f"{DATA}/{fn}"; clients = rj(path, [])
+        path = f"{DATA}/{fn}"; clients = rj(path, []); before = copy.deepcopy(clients)
         res = cs.ingest("", clients, rows=rows); checked += 1
         upd += len(res["updated"]); review += len(res["suggestions"])
-        if res["updated"]: wj(path, clients)
-    return {"rows": len(rows), "advocates_checked": checked, "clients_updated": upd, "needs_review": review}
+        if res["updated"] and not r.dry:                       # dry = preview only, nothing is written
+            batch.append({"file": fn, "entries": cs.changed_entries(before, clients)}); wj(path, clients)
+    if batch: wj(f"{DATA}/_last_bulk_update.json", {"at": time.time(), "batch": batch})      # so the admin can undo it
+    return {"rows": len(rows), "dated": any(x.get("date") for x in rows), "advocates_checked": checked, "clients_updated": upd, "needs_review": review, "preview": r.dry}
+
+@app.post("/admin/cases/undo")
+def admin_cases_undo(authorization: str = Header(None)):
+    """Admin: revert the last bulk update, client by client, but never a client the advocate edited after it."""
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    last = rj(f"{DATA}/_last_bulk_update.json", None)
+    if not last: raise HTTPException(404, "Wapas karne ke liye koi bulk update nahi mili.")
+    restored = skipped = 0
+    for b in last.get("batch", []):
+        path = f"{DATA}/{b['file']}"; clients = rj(path, [])
+        d, s = cs.undo_entries(clients, b["entries"]); restored += d; skipped += s
+        if d: wj(path, clients)
+    try: os.remove(f"{DATA}/_last_bulk_update.json")
+    except OSError: pass
+    return {"restored": restored, "skipped_because_edited": skipped}
 
 @app.post("/admin/cases/districts")
 def admin_cases_districts(authorization: str = Header(None)):
@@ -1241,6 +1459,23 @@ def admin_cases_districts(authorization: str = Header(None)):
             e = counts.setdefault(d, [0, set()]); e[0] += 1; e[1].add(fn)
     return {"districts": sorted(({"district": d, "clients": v[0], "advocates": len(v[1])} for d, v in counts.items()), key=lambda x: -x["clients"])}
 
+@app.post("/admin/cases/status")
+def admin_cases_status(authorization: str = Header(None)):
+    """Admin: how many tracked cases already have a future date, how many are waiting for their next date (hearing passed), how many have none.
+    Counts only."""
+    import datetime as dt
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    today = dt.datetime.now(dt.timezone(dt.timedelta(hours=5))).date().isoformat()          # Pakistan time
+    n = {"tracked": 0, "current": 0, "awaiting": 0, "no_date": 0}
+    for fn in os.listdir(DATA):
+        if not fn.endswith("_clients.json"): continue
+        for c in rj(f"{DATA}/{fn}", []):
+            if not isinstance(c, dict) or not cs._pairs_of(f"{c.get('fir', '')} {c.get('case_no', '')}"): continue
+            d = str(c.get("date") or ""); n["tracked"] += 1
+            n["no_date" if not d else "awaiting" if d < today else "current"] += 1
+    return n
+
 BOARD_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Advocate AI - Daily Board</title>
@@ -1251,7 +1486,7 @@ BOARD_HTML = r"""<!doctype html>
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
 main{max-width:560px;margin:0 auto;padding:20px 16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
-input,button{font:inherit;padding:10px;border-radius:8px;border:1px solid var(--line);width:100%;box-sizing:border-box;margin:6px 0;background:var(--card);color:var(--fg)}
+input,button,textarea{font:inherit;padding:10px;border-radius:8px;border:1px solid var(--line);width:100%;box-sizing:border-box;margin:6px 0;background:var(--card);color:var(--fg)}
 button{background:var(--acc);color:var(--btn);border:0;cursor:pointer;font-weight:600}
 button:disabled{opacity:.5;cursor:default}
 label.row{display:flex;gap:8px;align-items:center;margin:8px 0}
@@ -1270,12 +1505,16 @@ small{opacity:.75}
 <div class="card" id="s2" hidden>
   <b>2) Daily Board PDF</b>
   <input id="f" type="file" accept="application/pdf,.pdf">
+  <textarea id="txt" rows="5" placeholder="Ya cause list ka text yahan paste karein (PDF na ho to)" style="width:100%;box-sizing:border-box"></textarea>
   <label class="row" id="allw" hidden><input id="all" type="checkbox"> Sab advocates ke clients update karein (admin)</label>
+  <label class="row" id="dryw" hidden><input id="dry" type="checkbox" checked> Pehle sirf preview (kuch update nahi hoga)</label>
   <button id="go" onclick="send()">Upload aur update</button>
 </div>
 <div class="card" id="s3" hidden>
   <b>Districts</b> <small>(admin)</small>
   <button onclick="districts()">Kis district ke kitne clients hain</button>
+  <button onclick="status()">Kitni cases ki agli tareekh abhi baqi hai</button>
+  <button onclick="undo()">Aakhri bulk update wapas lein</button>
   <pre id="dist"></pre>
 </div>
 <div class="card" id="out" hidden><pre id="msg"></pre><div id="sg"></div></div>
@@ -1297,7 +1536,7 @@ async function login(){
     var d = await api('/auth/login', {identifier: $('id').value.trim(), password: $('pw').value});
     T = d.token; $('s1').hidden = true; $('s2').hidden = false;
     $('allw').hidden = !(d.user && d.user.is_admin);
-    $('s3').hidden = $('allw').hidden;
+    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden;
     show('Login ho gaya. Ab PDF chunein.');
   } catch (e) { show(e.message); }
 }
@@ -1307,20 +1546,37 @@ async function districts(){
     $('dist').textContent = d.districts.length ? d.districts.map(function(x){ return x.district + ': ' + x.clients + ' clients (' + x.advocates + ' advocates)'; }).join('\n') : 'Abhi koi client nahi.';
   } catch (e) { show(e.message); }
 }
+async function status(){
+  try {
+    var d = await api('/admin/cases/status', {});
+    $('dist').textContent = d.tracked + ' cases track ho rahi hain\n' + d.current + ' ki agli tareekh aage ki hai\n' + d.awaiting + ' ki peshi guzar gayi, agli tareekh abhi nahi mili\n' + d.no_date + ' par koi tareekh nahi';
+  } catch (e) { show(e.message); }
+}
+async function undo(){
+  if (!confirm('Aakhri bulk update wapas liya jaye?')) return;
+  try {
+    var d = await api('/admin/cases/undo', {});
+    $('dist').textContent = d.restored + ' clients purani halat par wapas, ' + d.skipped_because_edited + ' chhor diye (advocate ne baad mein khud badal diye).';
+  } catch (e) { show(e.message); }
+}
 function b64(buf){
   var s = '', a = new Uint8Array(buf);
   for (var i = 0; i < a.length; i += 32768) s += String.fromCharCode.apply(null, a.subarray(i, i + 32768));
   return btoa(s);
 }
 async function send(){
-  var f = $('f').files[0];
-  if (!f) { show('Pehle PDF chunein.'); return; }
+  var f = $('f').files[0], t = $('txt').value.trim();
+  if (!f && !t) { show('Pehle PDF chunein ya cause list ka text paste karein.'); return; }
   $('go').disabled = true; $('sg').textContent = ''; show('PDF parh raha hoon...');
   try {
     var all = $('all').checked && !$('allw').hidden;
-    var d = await api(all ? '/admin/cases/ingest' : '/cases/ingest', {pdf_b64: b64(await f.arrayBuffer())});
+    var body = f ? {pdf_b64: b64(await f.arrayBuffer())} : {raw: t};
+    if (all) body.dry = $('dry').checked;
+    var d = await api(all ? '/admin/cases/ingest' : '/cases/ingest', body);
     var t = d.rows + ' cases parhi gayin.\n';
+    if (d.rows && d.dated === false) t += 'Board par tareekh nahi mili, is liye sirf stage update ho sakti hai.\n';
     if (all) {
+      if (d.preview) t = 'PREVIEW (kuch badla nahi): ' + t;
       t += d.advocates_checked + ' advocates check hue, ' + d.clients_updated + ' clients update hue, ' + d.needs_review + ' ki tasdeeq baqi (woh advocate apne account se karega).';
     } else {
       t += d.updated.length + ' client update hue, ' + d.suggestions.length + ' ki tasdeeq darkar.';
