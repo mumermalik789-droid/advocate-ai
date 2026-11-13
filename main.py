@@ -782,7 +782,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v19", "model": MODEL, "data_dir": DATA}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v20-urdu-causelist", "model": MODEL, "data_dir": DATA}
 
 # ---------------------------------------------------------------- helpers
 def rj(path, default):
