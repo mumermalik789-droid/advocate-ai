@@ -788,7 +788,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v22-diary", "model": MODEL, "data_dir": DATA}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v23-admin-numbers", "model": MODEL, "data_dir": DATA}
 
 # ---------------------------------------------------------------- helpers
 def rj(path, default):
@@ -1501,10 +1501,10 @@ class DiaryIn(BaseModel): date: str = ""
 @app.post("/diary/pdf")
 def diary_pdf(r: DiaryIn, authorization: str = Header(None)):
     """Daily diary PDF of every client of the logged-in advocate. date = YYYY-MM-DD (empty = today, Pakistan time)."""
-    u, uid = current(authorization)
+    users, uid = current(authorization)
     day = r.date.strip() or (datetime.utcnow() + timedelta(hours=5)).date().isoformat()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day): raise HTTPException(400, "Tareekh YYYY-MM-DD mein likhein (jaise 2026-11-14).")
-    try: pdf = build_diary_pdf(rj(dpath(uid, "clients"), []), u.get("chamber_name", ""), day)
+    try: pdf = build_diary_pdf(rj(dpath(uid, "clients"), []), users[uid].get("chamber_name", ""), day)
     except ImportError: raise HTTPException(500, "Diary PDF ke liye server par reportlab install karein (requirements.txt mein 'reportlab' likh kar dobara deploy karein).")
     return Response(pdf, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="Daily_Diary_{day}.pdf"'})
 
@@ -1573,6 +1573,24 @@ def admin_cases_ingest(r: CasesAllIn, authorization: str = Header(None)):
             batch.append({"file": fn, "entries": cs.changed_entries(before, clients)}); wj(path, clients)
     if batch: wj(f"{DATA}/_last_bulk_update.json", {"at": time.time(), "batch": batch})      # so the admin can undo it
     return {"rows": len(rows), "dated": any(x.get("date") for x in rows), "advocates_checked": checked, "clients_updated": upd, "needs_review": review, "preview": r.dry}
+
+@app.post("/admin/cases/numbers")
+def admin_cases_numbers(authorization: str = Header(None)):
+    """Admin only: case / FIR numbers (with court, date, stage) of every advocate's clients. Client names and phone numbers are not included."""
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    out = []
+    for k, u in users.items():
+        if u.get("is_admin"): continue
+        rows = [c for c in rj(dpath(k, "clients"), []) if isinstance(c, dict)]
+        cases = [{"case_no": str(c.get("case_no") or ""), "fir": str(c.get("fir") or ""), "court": str(c.get("court") or ""),
+                  "date": str(c.get("date") or ""), "stage": str(c.get("stage") or "")} for c in rows if c.get("case_no") or c.get("fir")]
+        out.append({"advocate": str(u.get("chamber_name", "")), "clients": len(rows), "without_number": len(rows) - len(cases), "cases": cases})
+    out.sort(key=lambda a: a["advocate"].lower())
+    try:                                                              # who looked, and when - kept so the access can be shown to advocates
+        with open(f"{DATA}/_admin_views.log", "a", encoding="utf-8") as f: f.write(f"{datetime.utcnow().isoformat()}Z admin={uid} cases/numbers\n")
+    except OSError: pass
+    return {"advocates": out, "total_cases": sum(len(a["cases"]) for a in out)}
 
 @app.post("/admin/cases/undo")
 def admin_cases_undo(authorization: str = Header(None)):
@@ -1663,6 +1681,12 @@ small{opacity:.75}
   <button onclick="undo()">Aakhri bulk update wapas lein</button>
   <pre id="dist"></pre>
 </div>
+<div class="card" id="s5" hidden>
+  <b>Advocates ke case numbers (admin)</b> <small>- naam aur phone nahi dikhte</small>
+  <input id="cq" placeholder="Case no / advocate / court se dhoondein" oninput="if (CN) drawCN()">
+  <button onclick="caseNums()">Fehrist dikhayein</button>
+  <div id="cn"></div>
+</div>
 <div class="card" id="s4" hidden>
   <b>Daily Diary (PDF)</b> <small>- aap ke sab cases</small>
   <input id="dd" type="date">
@@ -1671,7 +1695,7 @@ small{opacity:.75}
 </div>
 <div class="card" id="out" hidden><pre id="msg"></pre><div id="sg"></div></div>
 <script>
-var T = null, LAST = null;
+var T = null, LAST = null, CN = null;
 function $(i){ return document.getElementById(i); }
 function show(t){ $('out').hidden = false; $('msg').textContent = t; }
 async function api(path, body){
@@ -1688,9 +1712,24 @@ async function login(){
     var d = await api('/auth/login', {identifier: $('id').value.trim(), password: $('pw').value});
     T = d.token; $('s1').hidden = true; $('s2').hidden = false;
     $('allw').hidden = !(d.user && d.user.is_admin);
-    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden; $('s4').hidden = false;
+    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden; $('s4').hidden = false; $('s5').hidden = $('allw').hidden;
     show('Login ho gaya. Ab PDF chunein.');
   } catch (e) { show(e.message); }
+}
+async function caseNums(){
+  try { CN = await api('/admin/cases/numbers', {}); drawCN(); } catch (e) { show(e.message); }
+}
+function drawCN(){
+  var q = $('cq').value.trim().toLowerCase(), box = $('cn'); box.textContent = '';
+  CN.advocates.forEach(function(a){
+    var rows = a.cases.filter(function(c){ return !q || (a.advocate + ' ' + c.case_no + ' ' + c.fir + ' ' + c.court).toLowerCase().indexOf(q) >= 0; });
+    if (!rows.length) return;
+    var h = document.createElement('div'); h.style.cssText = 'margin-top:14px;font-weight:700';
+    h.textContent = a.advocate + ' - ' + rows.length + ' case(s), ' + a.clients + ' client(s)' + (a.without_number ? ', ' + a.without_number + ' ka number likha nahi' : '');
+    box.appendChild(h);
+    rows.forEach(function(c){ var d = document.createElement('div'); d.textContent = [c.case_no, c.fir, c.court, c.date, c.stage].filter(Boolean).join(' | '); box.appendChild(d); });
+  });
+  if (!box.firstChild) box.textContent = 'Kuch nahi mila.';
 }
 async function diary(){
   try {
