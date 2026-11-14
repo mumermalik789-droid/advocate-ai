@@ -583,17 +583,23 @@ def ingest(raw, clients, district="", ps="", today=None, rows=None):
     rows = _collapse(rows if rows is not None else parse(raw), today or date.today().isoformat())
     for r in rows:
         if ps and not r["ps"]: r["ps"] = ps
-    updated, sugg, hit = [], [], set()
+    updated, sugg, hit, nf = [], [], set(), []
+    td = today or date.today().isoformat()
+    rds = {district_in(r.get("court", "")) for r in rows} - {""}
     for i, c in enumerate(clients):
         sc = sorted(((*_score(c, r, ps), k) for k, r in enumerate(rows)), key=lambda t: -t[0])
-        if not sc or sc[0][0] == 0: continue
+        if not sc or sc[0][0] == 0:
+            cd, dd = district_of(c), str(c.get("date") or "")
+            if _pairs_of(f"{c.get('fir', '')} {c.get('case_no', '')}") and (not dd or dd <= td) and not (cd and rds and cd not in rds):
+                nf.append({"client_index": i, "client": c.get("name", ""), "case_no": str(c.get("case_no") or c.get("fir") or "")[:60]})
+            continue
         s, why, k = sc[0]; tie = len(sc) > 1 and sc[1][0] >= s; hit.add(k)
         if s >= 90 and not tie:
-            updated.append({"client": c.get("name", ""), "fir": c.get("fir", ""), "changes": apply(c, rows[k], today) or ["koi naya badlao nahi"]})
+            updated.append({"client": c.get("name", ""), "fir": c.get("fir", ""), "case_no": str(c.get("case_no") or c.get("fir") or ""), "changes": apply(c, rows[k], today) or ["koi naya badlao nahi"]})
         else:
-            sugg.append({"client_index": i, "client": c.get("name", ""), "preview": _prev(rows[k]), "row": clean_row(rows[k]),
+            sugg.append({"client_index": i, "client": c.get("name", ""), "case_no": str(c.get("case_no") or c.get("fir") or ""), "preview": _prev(rows[k]), "row": clean_row(rows[k]),
                          "why": why + (" (aik se ziyada rows milti hain)" if tie else "")})
-    return {"rows": len(rows), "dated": any(r.get("date") for r in rows), "updated": updated, "suggestions": sugg, "unmatched_rows": max(0, len(rows) - len(hit))}
+    return {"rows": len(rows), "dated": any(r.get("date") for r in rows), "updated": updated, "suggestions": sugg, "not_found": nf[:100], "not_found_total": len(nf), "unmatched_rows": max(0, len(rows) - len(hit))}
 
 
 # ---- official feed (only if PITB / D&SJ grants one). Expected JSON: {"rows":[{"fir_no","fir_year","case_no","case_year",
@@ -782,7 +788,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v20-urdu-causelist", "model": MODEL, "data_dir": DATA}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v22-diary", "model": MODEL, "data_dir": DATA}
 
 # ---------------------------------------------------------------- helpers
 def rj(path, default):
@@ -1342,8 +1348,120 @@ def citations_import(r: CitImport, authorization: str = Header(None)):
     return cit.import_text(r.text, r.source)
 
 # ---------------------------------------------------------------- district court case sync
+# --- DIARY BEGIN
+_AR = "\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF"
+_AR_RUN = re.compile(f"[{_AR}][{_AR}\u200c\u200d ]*")
+_DIARY_FONTS = ("/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf", "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Regular.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+
+
+def _diary_setup():
+    """Urdu in the PDF needs a font file AND arabic_reshaper + python-bidi on the server; without them Urdu words print as [Urdu]."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    ok = False
+    for p in [os.environ.get("DIARY_FONT", "")] + list(_DIARY_FONTS):
+        if p and os.path.exists(p):
+            try: pdfmetrics.registerFont(TTFont("DiaryFont", p)); ok = True; break
+            except Exception: pass
+    shape = None
+    if ok:
+        try:
+            import arabic_reshaper
+            from bidi.algorithm import get_display
+            shape = lambda seg: get_display(arabic_reshaper.reshape(seg))
+        except Exception: shape = None
+    return shape
+
+
+def _dmy(d):
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", str(d or ""))
+    return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else str(d or "-")
+
+
+def build_diary_pdf(clients, chamber, day):
+    """Daily diary of ALL the advocate's cases: today's hearings (with space to write the result), upcoming dates, then dates that passed / are missing."""
+    from io import BytesIO
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    shape, note = _diary_setup(), [False]
+
+    def txt(s):
+        s, out, last = str(s or ""), [], 0
+        for m in _AR_RUN.finditer(s):
+            out.append(escape(s[last:m.start()])); seg = m.group(0).strip()
+            if shape and seg: out.append('<font name="DiaryFont">' + escape(shape(seg)) + "</font>" + (" " if m.group(0).endswith(" ") else ""))
+            else: out.append("[Urdu] "); note[0] = True
+            last = m.end()
+        return "".join(out) + escape(s[last:])
+
+    base = ParagraphStyle("b", fontName="Helvetica", fontSize=8.5, leading=10.5)
+    hd = ParagraphStyle("hd", parent=base, fontName="Helvetica-Bold", textColor=colors.white)
+    h1 = ParagraphStyle("h1", parent=base, fontName="Helvetica-Bold", fontSize=18, leading=22)
+    h2 = ParagraphStyle("h2", parent=base, fontName="Helvetica-Bold", fontSize=11.5, leading=15, spaceBefore=12, spaceAfter=4)
+    P = lambda *lines, st=base: Paragraph("<br/>".join(txt(x) for x in lines if str(x or "").strip()) or "-", st)
+
+    def ids(c):
+        fir, cn = str(c.get("fir") or ""), str(c.get("case_no") or "")
+        return [fir, ("Case no: " + cn) if cn and cn not in fir else "", ("PS: " + str(c["ps"])) if c.get("ps") else ""]
+
+    def table(head, rows, widths):
+        t = Table([[Paragraph(h, hd) for h in head]] + rows, colWidths=[w * mm for w in widths], repeatRows=1)
+        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0b5d44")), ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#9aa7a1")),
+                               ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                               ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                               ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f6f4")])]))
+        return t
+
+    nm = lambda c: str(c.get("name") or "")
+    cl = [c for c in clients if isinstance(c, dict)]
+    now = [c for c in cl if c.get("date") == day]
+    later = [c for c in cl if str(c.get("date") or "") > day]
+    gone = [c for c in cl if not c.get("date") or str(c.get("date")) < day]
+    now.sort(key=lambda c: (str(c.get("court") or ""), nm(c))); later.sort(key=lambda c: (str(c["date"]), nm(c))); gone.sort(key=lambda c: (str(c.get("date") or "9999"), nm(c)))
+    try:
+        import datetime as _dt
+        wd = _dt.date.fromisoformat(day).strftime("%A, %d %B %Y")
+    except Exception: wd = _dmy(day)
+
+    S = [Paragraph("DAILY DIARY", h1), P(chamber or "Advocate", st=ParagraphStyle("s", parent=base, fontSize=11, leading=14)), P(wd, st=ParagraphStyle("s2", parent=base, fontSize=11, leading=14)),
+         Spacer(1, 3), P(f"Aaj ki peshi: {len(now)}   |   Aane wali peshian: {len(later)}   |   Tareekh guzri / darj nahi: {len(gone)}   |   Kul cases: {len(cl)}")]
+    S.append(Paragraph(f"1) Aaj ki peshi ({_dmy(day)})", h2))
+    if now:
+        S.append(table(["#", "Client", "Phone", "FIR / Case no", "Court", "Stage", "Aaj ki karwai / agli tareekh"],
+                       [[Paragraph(str(i), base), P(nm(c)), P(c.get("phone", "")), P(*ids(c)), P(c.get("court", "")), P(c.get("stage", "")), Paragraph("<br/><br/><br/>", base)]
+                        for i, c in enumerate(now, 1)], [8, 45, 28, 45, 55, 35, 61]))
+    else: S.append(P("Is din ki koi peshi darj nahi."))
+    S.append(Paragraph("2) Aane wali peshian", h2))
+    if later:
+        S.append(table(["Tareekh", "Client", "FIR / Case no", "Court", "Stage", "Notes"],
+                       [[Paragraph(_dmy(c["date"]), base), P(nm(c)), P(*ids(c)), P(c.get("court", "")), P(c.get("stage", "")), P(str(c.get("notes") or "")[:110])] for c in later],
+                       [22, 50, 48, 55, 40, 62]))
+    else: S.append(P("Aage ki koi tareekh darj nahi."))
+    S.append(Paragraph("3) Tareekh guzar chuki ya darj nahi (update karein)", h2))
+    if gone:
+        S.append(table(["Aakhri tareekh", "Client", "FIR / Case no", "Court", "Stage", "Notes"],
+                       [[Paragraph(_dmy(c.get("date")), base), P(nm(c)), P(*ids(c)), P(c.get("court", "")), P(c.get("stage", "")), P(str(c.get("notes") or "")[:110])] for c in gone],
+                       [22, 50, 48, 55, 40, 62]))
+    else: S.append(P("Koi nahi."))
+    if note[0]: S.append(Spacer(1, 8)); S.append(P("Note: Urdu likhai is PDF mein nahi aa saki ([Urdu] likha hai) - app mein dekh lein.", st=ParagraphStyle("n", parent=base, textColor=colors.grey)))
+
+    def foot(cv, d):
+        cv.saveState(); cv.setFont("Helvetica", 7.5); cv.setFillColor(colors.grey)
+        cv.drawString(12 * mm, 8 * mm, f"Advocate AI - Daily Diary {_dmy(day)}"); cv.drawRightString(landscape(A4)[0] - 12 * mm, 8 * mm, f"Page {d.page}"); cv.restoreState()
+    bio = BytesIO()
+    SimpleDocTemplate(bio, pagesize=landscape(A4), leftMargin=12 * mm, rightMargin=12 * mm, topMargin=12 * mm, bottomMargin=14 * mm, title="Daily Diary").build(S, onFirstPage=foot, onLaterPages=foot)
+    return bio.getvalue()
+# --- DIARY END
+
+
 class CasesIn(BaseModel): raw: str = ""; pdf_b64: str = ""; district: str = ""; ps: str = ""
-class CasesConfirm(BaseModel): client_index: int; row: dict
+class CasesConfirm(BaseModel): client_index: int; row: dict; case_no: str = ""
+class CasesFind(BaseModel): raw: str = ""; pdf_b64: str = ""; case_no: str
 
 @app.post("/cases/ingest")
 def cases_ingest(r: CasesIn, authorization: str = Header(None)):
@@ -1359,8 +1477,36 @@ def cases_confirm(r: CasesConfirm, authorization: str = Header(None)):
     _, uid = current(authorization)
     path = dpath(uid, "clients"); clients = rj(path, [])
     if not 0 <= r.client_index < len(clients): raise HTTPException(404, "Client nahi mila.")
-    ch = cs.apply(clients[r.client_index], cs.clean_row(r.row)); wj(path, clients)
+    c = clients[r.client_index]; ch = cs.apply(c, cs.clean_row(r.row))
+    cn = r.case_no.strip()[:40]
+    if cn and cs._pairs_of(cn) and cn != str(c.get("case_no") or ""):        # number typed by the advocate: keep it so the next lists match by themselves
+        if c.get("case_no"): c["old_case_no"] = c["case_no"]
+        c["case_no"] = cn; ch = list(ch) + ["case no: " + cn]
+    wj(path, clients)
     return {"changes": ch}
+
+@app.post("/cases/find")
+def cases_find(r: CasesFind, authorization: str = Header(None)):
+    """Look one specific case number up in the list that was just uploaded (nothing is changed here)."""
+    current(authorization)
+    if len(r.raw) > 600_000 or len(r.pdf_b64) > 12_000_000: raise HTTPException(400, "Data bohat bara hai.")
+    want = cs._pairs_of(r.case_no)
+    if not want: raise HTTPException(400, "Case number sahi likhein (jaise 2633798/26 ya 776/2026).")
+    rows = cs._collapse(_pdf_rows(r.pdf_b64) if r.pdf_b64 else cs.parse(r.raw), cs.date.today().isoformat())
+    hits = [x for x in rows if want & set(map(tuple, x["pairs"]))]
+    return {"matches": [{"preview": cs._prev(x), "row": cs.clean_row(x)} for x in hits[:5]]}
+
+class DiaryIn(BaseModel): date: str = ""
+
+@app.post("/diary/pdf")
+def diary_pdf(r: DiaryIn, authorization: str = Header(None)):
+    """Daily diary PDF of every client of the logged-in advocate. date = YYYY-MM-DD (empty = today, Pakistan time)."""
+    u, uid = current(authorization)
+    day = r.date.strip() or (datetime.utcnow() + timedelta(hours=5)).date().isoformat()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day): raise HTTPException(400, "Tareekh YYYY-MM-DD mein likhein (jaise 2026-11-14).")
+    try: pdf = build_diary_pdf(rj(dpath(uid, "clients"), []), u.get("chamber_name", ""), day)
+    except ImportError: raise HTTPException(500, "Diary PDF ke liye server par reportlab install karein (requirements.txt mein 'reportlab' likh kar dobara deploy karein).")
+    return Response(pdf, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="Daily_Diary_{day}.pdf"'})
 
 # Full automation switch: only if PITB / D&SJ grants an official feed (set COURT_API_URL and COURT_API_KEY on the server).
 COURT_API_URL, COURT_API_KEY = os.environ.get("COURT_API_URL", ""), os.environ.get("COURT_API_KEY", "")
@@ -1517,9 +1663,15 @@ small{opacity:.75}
   <button onclick="undo()">Aakhri bulk update wapas lein</button>
   <pre id="dist"></pre>
 </div>
+<div class="card" id="s4" hidden>
+  <b>Daily Diary (PDF)</b> <small>- aap ke sab cases</small>
+  <input id="dd" type="date">
+  <small>Tareekh khali chhorein to aaj ki diary banegi.</small>
+  <button onclick="diary()">Diary PDF download karein</button>
+</div>
 <div class="card" id="out" hidden><pre id="msg"></pre><div id="sg"></div></div>
 <script>
-var T = null;
+var T = null, LAST = null;
 function $(i){ return document.getElementById(i); }
 function show(t){ $('out').hidden = false; $('msg').textContent = t; }
 async function api(path, body){
@@ -1536,8 +1688,18 @@ async function login(){
     var d = await api('/auth/login', {identifier: $('id').value.trim(), password: $('pw').value});
     T = d.token; $('s1').hidden = true; $('s2').hidden = false;
     $('allw').hidden = !(d.user && d.user.is_admin);
-    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden;
+    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden; $('s4').hidden = false;
     show('Login ho gaya. Ab PDF chunein.');
+  } catch (e) { show(e.message); }
+}
+async function diary(){
+  try {
+    var r = await fetch('/diary/pdf', {method: 'POST', headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + T}, body: JSON.stringify({date: $('dd').value})});
+    if (!r.ok) { var e = {}; try { e = await r.json(); } catch (x) {} throw new Error(e.detail || ('Error ' + r.status)); }
+    var b = await r.blob(), a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = 'Daily_Diary_' + ($('dd').value || 'today') + '.pdf';
+    document.body.appendChild(a); a.click(); a.remove();
+    show('Diary download ho gayi.');
   } catch (e) { show(e.message); }
 }
 async function districts(){
@@ -1571,6 +1733,7 @@ async function send(){
   try {
     var all = $('all').checked && !$('allw').hidden;
     var body = f ? {pdf_b64: b64(await f.arrayBuffer())} : {raw: t};
+    LAST = body;
     if (all) body.dry = $('dry').checked;
     var d = await api(all ? '/admin/cases/ingest' : '/cases/ingest', body);
     var t = d.rows + ' cases parhi gayin.\n';
@@ -1579,17 +1742,44 @@ async function send(){
       if (d.preview) t = 'PREVIEW (kuch badla nahi): ' + t;
       t += d.advocates_checked + ' advocates check hue, ' + d.clients_updated + ' clients update hue, ' + d.needs_review + ' ki tasdeeq baqi (woh advocate apne account se karega).';
     } else {
-      t += d.updated.length + ' client update hue, ' + d.suggestions.length + ' ki tasdeeq darkar.';
-      d.updated.forEach(function(u){ t += '\n- ' + u.client + ': ' + u.changes.join(', '); });
+      t += d.updated.length + ' client update hue, ' + d.suggestions.length + ' ki tasdeeq darkar, ' + d.not_found_total + ' ka case no is list mein nahi mila.';
+      d.updated.forEach(function(u){ t += '\n- ' + u.client + (u.case_no ? ' (' + u.case_no + ')' : '') + ': ' + u.changes.join(', '); });
       d.suggestions.forEach(function(s){
         var div = document.createElement('div'); div.style.marginTop = '10px';
-        var sp = document.createElement('span'); sp.textContent = s.client + ' ? ' + s.why + ' | ' + s.preview;
+        var sp = document.createElement('span'); sp.textContent = s.client + (s.case_no ? ' (' + s.case_no + ')' : '') + ' ? ' + s.why + ' | ' + s.preview;
         var b = document.createElement('button'); b.textContent = 'Haan, update';
         b.onclick = async function(){
           try { await api('/cases/confirm', {client_index: s.client_index, row: s.row}); b.disabled = true; b.textContent = 'Ho gaya'; }
           catch (e) { show(e.message); }
         };
         div.appendChild(sp); div.appendChild(b); $('sg').appendChild(div);
+      });
+      (d.not_found || []).forEach(function(n){
+        var div = document.createElement('div'); div.style.marginTop = '14px';
+        var sp = document.createElement('div'); sp.textContent = n.client + ' - is list mein nahi mila';
+        var inp = document.createElement('input'); inp.value = n.case_no || ''; inp.placeholder = 'Case no (jaise 2633798/26)';
+        var b = document.createElement('button'); b.textContent = 'Is number se dhoondein';
+        var res = document.createElement('div');
+        b.onclick = async function(){
+          res.textContent = '';
+          try {
+            var q = {case_no: inp.value.trim()};
+            if (LAST.pdf_b64) q.pdf_b64 = LAST.pdf_b64; else q.raw = LAST.raw;
+            var m = await api('/cases/find', q);
+            if (!m.matches.length) { res.textContent = 'Is number ka case is list mein nahi hai.'; return; }
+            m.matches.forEach(function(x){
+              var r = document.createElement('div'); r.style.marginTop = '6px';
+              var s2 = document.createElement('span'); s2.textContent = x.preview;
+              var b2 = document.createElement('button'); b2.textContent = 'Haan, ' + n.client + ' ko update karein';
+              b2.onclick = async function(){
+                try { await api('/cases/confirm', {client_index: n.client_index, row: x.row, case_no: inp.value.trim()}); b2.disabled = true; b2.textContent = 'Ho gaya'; }
+                catch (e) { show(e.message); }
+              };
+              r.appendChild(s2); r.appendChild(b2); res.appendChild(r);
+            });
+          } catch (e) { res.textContent = e.message; }
+        };
+        div.appendChild(sp); div.appendChild(inp); div.appendChild(b); div.appendChild(res); $('sg').appendChild(div);
       });
     }
     show(t);
