@@ -4,3 +4,4 @@ anthropic
 python-docx
 pydantic
 pdfplumber
+reportlab
