@@ -788,24 +788,88 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v23-admin-numbers", "model": MODEL, "data_dir": DATA}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v24-durable-storage", "model": MODEL, "data_dir": DATA, "storage": "upstash" if REMOTE else "disk"}
 
 # ---------------------------------------------------------------- helpers
-def rj(path, default):
+# --- STORE BEGIN
+import copy
+UP_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+UP_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+REMOTE = bool(UP_URL and UP_TOKEN)         # True: accounts/clients live in Upstash (permanent, free); False: local disk as before
+_PFX, _CACHE = "advocate:", {}             # one server instance: reads are served from memory, every write goes to Upstash first
+print("[storage]", "Upstash (permanent)" if REMOTE else f"local disk '{DATA}' (Render free par server sone/redeploy par mit jata hai)", flush=True)
+
+
+def _up(cmd):
+    """One Redis command over Upstash's REST API (plain HTTPS, so it also works on Render's free plan)."""
+    req = urllib.request.Request(UP_URL, data=json.dumps(cmd).encode(), method="POST",
+                                 headers={"Authorization": "Bearer " + UP_TOKEN, "Content-Type": "application/json"})
+    last = None
+    for _ in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r: d = json.loads(r.read().decode())
+            if isinstance(d, dict) and d.get("error"): raise RuntimeError("Upstash: " + str(d["error"])[:120])
+            return d.get("result")
+        except urllib.error.HTTPError as e: raise RuntimeError(f"Upstash {e.code}: {e.read().decode('utf-8', 'ignore')[:120]}")
+        except RuntimeError: raise
+        except Exception as e: last = e; time.sleep(0.4)
+    raise RuntimeError(f"Upstash se rabta nahi ho saka: {last}")
+
+
+def _rk(path):
+    if not REMOTE: return None
+    p, d = os.path.abspath(path), os.path.abspath(DATA)
+    return _PFX + p[len(d) + 1:].replace(os.sep, "/") if p.startswith(d + os.sep) else None
+
+
+def _rj_file(path, default):
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
 
+
+def rj(path, default):
+    k = _rk(path)
+    if not k: return _rj_file(path, default)
+    if k in _CACHE: return copy.deepcopy(_CACHE[k])
+    raw = _up(["GET", k])                    # a failed request raises: never answer "empty" when the store is merely unreachable
+    if raw is None:
+        local = _rj_file(path, None)         # first start after switching to Upstash: take over what is still on the local disk
+        if local is None: return default
+        wj(path, local); return copy.deepcopy(local)
+    obj = json.loads(raw); _CACHE[k] = obj
+    return copy.deepcopy(obj)
+
+
 _WLOCK = threading.Lock()
 def wj(path, data):
-    """Pehle temp file mein likh kar badalta hai, taake crash par users.json kharab/khali na ho."""
+    """Remote: written to Upstash. Local: temp file first, then rename, so a crash never leaves users.json empty."""
+    k = _rk(path)
     with _WLOCK:
+        if k:
+            _up(["SET", k, json.dumps(data, ensure_ascii=False)]); _CACHE[k] = copy.deepcopy(data); return
         tmp = f"{path}.{secrets.token_hex(3)}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
+
+
+def data_files():
+    """Names of every stored file (Upstash keys plus anything still on the local disk)."""
+    names = set(os.listdir(DATA)) if os.path.isdir(DATA) else set()
+    if REMOTE: names |= {k[len(_PFX):] for k in (_up(["KEYS", _PFX + "*"]) or [])}
+    return sorted(names)
+
+
+def rm(path):
+    k = _rk(path)
+    if k:
+        with _WLOCK: _up(["DEL", k]); _CACHE.pop(k, None)
+    try: os.remove(path)
+    except OSError: pass
+# --- STORE END
 
 def _h(t): return hashlib.sha256(t.encode()).hexdigest()
 
@@ -905,7 +969,7 @@ def send_email(to, subject, body):
             s.starttls(context=ssl.create_default_context()); s.login(SMTP_USER, SMTP_PASS); s.send_message(m)
         return True, ""
     except Exception as e:
-        return False, f"Email send nahi ho saka: {e}"
+        return False, f"Email send nahi ho saka: {e}. (Render free par Gmail SMTP band hota hai - Environment mein BREVO_API_KEY aur MAIL_FROM set karein.)"
 
 def otp_send(purpose, email, payload=None):
     key = f"{purpose}:{canonical_email(email)}"; now = time.time()
@@ -1515,7 +1579,7 @@ def _court_poll_causelist():
     """COURT_FEED_MODE=causelist: one feed request per district per day (all courts of that city), then update every advocate's clients."""
     import datetime as dt
     days = [(dt.date.today() + dt.timedelta(days=i)).isoformat() for i in range(max(1, int(os.environ.get("COURT_DAYS_AHEAD", "3"))))]
-    data = {fn: rj(f"{DATA}/{fn}", []) for fn in os.listdir(DATA) if fn.endswith("_clients.json")}
+    data = {fn: rj(f"{DATA}/{fn}", []) for fn in data_files() if fn.endswith("_clients.json")}
     def fetch(d, day):
         time.sleep(1)
         return cs.fetch_causelist(COURT_API_URL, COURT_API_KEY, d, day)
@@ -1523,7 +1587,7 @@ def _court_poll_causelist():
 
 def _court_poll_once():
     if os.environ.get("COURT_FEED_MODE", "case") == "causelist": return _court_poll_causelist()
-    for fn in os.listdir(DATA):
+    for fn in data_files():
         if not fn.endswith("_clients.json"): continue
         path, changed = f"{DATA}/{fn}", False
         clients = rj(path, [])
@@ -1564,7 +1628,7 @@ def admin_cases_ingest(r: CasesAllIn, authorization: str = Header(None)):
     import copy
     rows, checked, upd, review, batch = (_pdf_rows(r.pdf_b64) if r.pdf_b64 else cs.parse(r.raw)), 0, 0, 0, []
     for x in rows: (x.get("extra") or {}).pop("comments", None)     # the uploading office's own comments never go to other advocates
-    for fn in os.listdir(DATA):
+    for fn in data_files():
         if not fn.endswith("_clients.json"): continue
         path = f"{DATA}/{fn}"; clients = rj(path, []); before = copy.deepcopy(clients)
         res = cs.ingest("", clients, rows=rows); checked += 1
@@ -1588,8 +1652,9 @@ def admin_cases_numbers(authorization: str = Header(None)):
         out.append({"advocate": str(u.get("chamber_name", "")), "clients": len(rows), "without_number": len(rows) - len(cases), "cases": cases})
     out.sort(key=lambda a: a["advocate"].lower())
     try:                                                              # who looked, and when - kept so the access can be shown to advocates
-        with open(f"{DATA}/_admin_views.log", "a", encoding="utf-8") as f: f.write(f"{datetime.utcnow().isoformat()}Z admin={uid} cases/numbers\n")
-    except OSError: pass
+        lg = rj(f"{DATA}/_admin_views.json", []); lg.append({"at": datetime.utcnow().isoformat() + "Z", "admin": uid, "what": "cases/numbers"})
+        wj(f"{DATA}/_admin_views.json", lg[-500:])
+    except Exception: pass
     return {"advocates": out, "total_cases": sum(len(a["cases"]) for a in out)}
 
 @app.post("/admin/cases/undo")
@@ -1604,8 +1669,7 @@ def admin_cases_undo(authorization: str = Header(None)):
         path = f"{DATA}/{b['file']}"; clients = rj(path, [])
         d, s = cs.undo_entries(clients, b["entries"]); restored += d; skipped += s
         if d: wj(path, clients)
-    try: os.remove(f"{DATA}/_last_bulk_update.json")
-    except OSError: pass
+    rm(f"{DATA}/_last_bulk_update.json")
     return {"restored": restored, "skipped_because_edited": skipped}
 
 @app.post("/admin/cases/districts")
@@ -1615,7 +1679,7 @@ def admin_cases_districts(authorization: str = Header(None)):
     users, uid = current(authorization)
     if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
     counts = {}
-    for fn in os.listdir(DATA):
+    for fn in data_files():
         if not fn.endswith("_clients.json"): continue
         for c in rj(f"{DATA}/{fn}", []):
             if not isinstance(c, dict) or not cs._pairs_of(f"{c.get('fir', '')} {c.get('case_no', '')}"): continue
@@ -1632,7 +1696,7 @@ def admin_cases_status(authorization: str = Header(None)):
     if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
     today = dt.datetime.now(dt.timezone(dt.timedelta(hours=5))).date().isoformat()          # Pakistan time
     n = {"tracked": 0, "current": 0, "awaiting": 0, "no_date": 0}
-    for fn in os.listdir(DATA):
+    for fn in data_files():
         if not fn.endswith("_clients.json"): continue
         for c in rj(f"{DATA}/{fn}", []):
             if not isinstance(c, dict) or not cs._pairs_of(f"{c.get('fir', '')} {c.get('case_no', '')}"): continue
@@ -1879,6 +1943,5 @@ def admin_delete(r: AdminId, authorization: str = Header(None)):
     if r.id == "admin" or r.id not in users: raise HTTPException(400, "Ye account delete nahi ho sakta.")
     del users[r.id]; wj(USERS_FILE, users)
     for col in list(COLS) + ["templates"]:
-        try: os.remove(dpath(r.id, col))
-        except OSError: pass
+        rm(dpath(r.id, col))
     return {"ok": True}
