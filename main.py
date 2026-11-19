@@ -31,6 +31,17 @@ from datetime import date
 DATA = os.environ.get("DATA_DIR", "data")
 GLOBAL_IDX = f"{DATA}/verified_citations.jsonl"
 _LOCK, _CACHE = threading.Lock(), {"mtime": None, "rows": {}}
+HOOK = {"rj": None, "wj": None}                    # main.py plugs its durable rj / wj in here
+GLOBAL_JSON, REQ_JSON, _GV = f"{DATA}/verified_citations.json", f"{DATA}/citation_requests.json", {"ver": 0}
+LIB_BYTES = 6_000_000                               # about 10,000 entries; Upstash free allows 10 MB per request
+
+
+def _rjs(path, default): return HOOK["rj"](path, default) if HOOK["rj"] else _read_json(path, default)
+
+
+def _wjs(path, data):
+    if HOOK["wj"]: HOOK["wj"](path, data)
+    else: os.makedirs(DATA, exist_ok=True); _write_json(path, data)
 
 # First eight are the reporters Pakistan Law Site publishes. Other codes are recognised; name left blank if unsure.
 REPORTERS = {"PLD": "Pakistan Legal Decisions", "SCMR": "Supreme Court Monthly Review", "CLC": "Civil Law Cases",
@@ -55,17 +66,17 @@ _B = re.compile(rf"\b(?P<year>(?:19|20)\d\d)\s*(?P<code>{_CODES})\s*(?:[(\[]\s*(
 
 MSG = {
     "English": {"verified": "VERIFIED ✔ found in the verified database",
-                "unindexed": "NOT CONFIRMED - format is valid but it is not in the verified database. Do not rely on it until you check it on Pakistan Law Site, EastLaw or the court's own website.",
+                "unindexed": "NOT CONFIRMED - this citation is not in the verified library yet, so do not rely on it. It has been sent to the admin team for verification; once it is added, the full details will show here.",
                 "implausible_year": "NOT VALID - this year is impossible for a Pakistani law report.",
                 "invalid": "This is not a recognised Pakistani law-report citation. Expected forms: PLD 2020 SC 1, 2021 SCMR 1234, 2020 YLR 123 (Lahore).",
                 "source": "Source", "open": "Check at"},
     "Roman": {"verified": "TASDEEQ SHUDA ✔ verified database mein maujood hai",
-              "unindexed": "TASDEEQ NAHI HUI - format durust hai magar verified database mein nahi. Pakistan Law Site, EastLaw ya court ki apni website par check kiye baghair is par bharosa na karein.",
+              "unindexed": "TASDEEQ NAHI HUI - ye citation verified library mein abhi nahi, is liye is par bharosa na karein. Tasdeeq ke liye admin team ko bhej diya gaya hai; add hote hi poori tafseel yahin nazar aayegi.",
               "implausible_year": "GHALAT - ye saal Pakistani law report ke liye mumkin nahi.",
               "invalid": "Ye Pakistani law-report ka durust citation nahi lagta. Durust misalein: PLD 2020 SC 1, 2021 SCMR 1234, 2020 YLR 123 (Lahore).",
               "source": "Zareya", "open": "Yahan check karein"},
     "Urdu": {"verified": "تصدیق شدہ ✔ تصدیق شدہ ڈیٹا بیس میں موجود ہے",
-             "unindexed": "تصدیق نہیں ہوئی - فارمیٹ درست ہے مگر تصدیق شدہ ڈیٹا بیس میں موجود نہیں۔ پاکستان لا سائٹ، ایسٹ لا یا عدالت کی اپنی ویب سائٹ پر دیکھے بغیر اس پر انحصار نہ کریں۔",
+             "unindexed": "تصدیق نہیں ہوئی - یہ حوالہ تصدیق شدہ لائبریری میں ابھی موجود نہیں، اس لیے اس پر انحصار نہ کریں۔ تصدیق کے لیے ایڈمن ٹیم کو بھیج دیا گیا ہے؛ شامل ہوتے ہی مکمل تفصیل یہیں نظر آئے گی۔",
              "implausible_year": "غلط - یہ سال پاکستانی لاء رپورٹ کے لیے ممکن نہیں۔",
              "invalid": "یہ پاکستانی لاء رپورٹ کا درست حوالہ نہیں۔ درست مثالیں: PLD 2020 SC 1، 2021 SCMR 1234، 2020 YLR 123 (Lahore)",
              "source": "ذریعہ", "open": "یہاں دیکھیں"},
@@ -121,38 +132,153 @@ def _rows_to_idx(rows):
     return idx
 
 
+def _global_rows():
+    rows = _rjs(GLOBAL_JSON, None)
+    if rows is None:                                # first use: take over the old verified_citations.jsonl if it is still on the disk
+        rows = _read_jsonl(GLOBAL_IDX)
+        if rows: _wjs(GLOBAL_JSON, rows)
+    return rows if isinstance(rows, list) else []
+
+
 def index(user_path=None):
     """Global verified index + this advocate's own 'verified by me' library (his entries win)."""
-    try: mt = os.path.getmtime(GLOBAL_IDX)
-    except OSError: mt = None
     with _LOCK:
-        if _CACHE["mtime"] != mt: _CACHE["rows"], _CACHE["mtime"] = _rows_to_idx(_read_jsonl(GLOBAL_IDX)), mt
+        if _CACHE["mtime"] != _GV["ver"]: _CACHE["rows"], _CACHE["mtime"] = _rows_to_idx(_global_rows()), _GV["ver"]
         g = _CACHE["rows"]
     return {**g, **(_rows_to_idx(_read_json(user_path, [])) if user_path else {})}
 
 
+# ---- topic map: Urdu / Roman Urdu / English words -> the English words the library entries use (better search, and shows where the library is empty)
+GAP_JSON = f"{DATA}/citation_gaps.json"
+
+
+def _qn(s): return (s or "").lower().replace("ي", "ی").replace("ك", "ک").replace("ۃ", "ہ").replace("ه", "ہ")
+
+
+_TOPICS = [(n, tuple(_qn(w) for w in tr), core, secs) for n, tr, core, secs in (
+    ("Bail after arrest", ("bail", "zamanat", "ضمانت", "497"), ("bail",), "497 498 crpc"),
+    ("Pre-arrest bail", ("pre-arrest", "prearrest", "qabl az giraftari", "قبل از گرفتاری", "interim bail"), ("bail", "pre-arrest", "prearrest"), "498 crpc"),
+    ("FIR registration / 22-A, 22-B", ("22-a", "22a", "22-b", "justice of peace", "اندراج مقدمہ", "registration of fir"), ("fir", "registration"), "154 22-a 22-b crpc"),
+    ("Quashment of FIR", ("quash", "quashment", "561-a", "561a"), ("quash", "quashment"), "561-a crpc"),
+    ("Acquittal 265-K", ("265-k", "265k", "acquittal", "bari"), ("acquittal",), "265-k crpc"),
+    ("Cheque dishonour 489-F", ("489-f", "489f", "cheque", "check bounce"), ("cheque", "489-f", "489f"), "489-f ppc"),
+    ("Murder / qatl", ("302", "murder", "qatl", "قتل"), ("murder", "qatl"), "302 324 ppc"),
+    ("Narcotics", ("narcotic", "narcotics", "منشیات", "manshiyat"), ("narcotic", "narcotics"), "9 cns act"),
+    ("Specific performance / agreement to sell", ("specific performance", "agreement to sell", "بیعنامہ", "bayana", "muahida"), ("specific", "agreement"), "12 54 specific relief act"),
+    ("Injunction / stay", ("injunction", "order 39", "حکم امتناعی", "stay order"), ("injunction",), "order xxxix cpc"),
+    ("Rejection of plaint", ("rejection of plaint", "order 7 rule 11", "o7r11"), ("plaint", "rejection"), "order vii rule 11 cpc"),
+    ("Limitation / condonation", ("limitation", "condonation", "میعاد", "mayad"), ("limitation", "condonation"), "limitation act 5"),
+    ("Setting aside ex-parte", ("ex parte", "ex-parte", "order 9", "یکطرفہ"), ("ex-parte", "exparte"), "order ix rule 13 cpc"),
+    ("Fraud on decree 12(2)", ("12(2)", "fraud", "misrepresentation", "فراڈ"), ("fraud", "misrepresentation"), "12(2) cpc"),
+    ("Revision / appeal", ("revision", "appeal", "نگرانی", "اپیل"), ("revision", "appeal"), "115 96 cpc"),
+    ("Summary suit Order 37", ("order 37", "summary suit", "leave to defend"), ("summary", "leave"), "order xxxvii cpc"),
+    ("Dower / maintenance", ("dower", "haq mehr", "حق مہر", "maintenance", "nafaqa", "نان نفقہ"), ("dower", "maintenance"), "family courts act 1964"),
+    ("Khula / dissolution of marriage", ("khula", "خلع", "dissolution of marriage"), ("khula", "dissolution"), "dissolution of muslim marriages act 1939"),
+    ("Custody / guardianship", ("custody", "guardian", "hizanat", "حضانت"), ("custody", "guardian", "guardianship"), "guardians and wards act 1890"),
+    ("Inheritance / partition", ("inheritance", "wirasat", "وراثت", "partition", "taqseem"), ("inheritance", "partition"), "legal heirs"),
+    ("Pre-emption", ("pre-emption", "preemption", "shufa", "شفعہ"), ("pre-emption", "preemption"), "punjab pre-emption act"),
+    ("Rent / ejectment", ("ejectment", "kiraya", "کرایہ", "tenant", "rented premises"), ("ejectment", "tenant", "rent"), "punjab rented premises act 2009"),
+    ("Evidence / witnesses", ("qanun-e-shahadat", "شہادت", "article 17", "article 79"), ("evidence", "witness"), "qanun-e-shahadat 1984"),
+    ("Cheating / fraud 420", ("420", "cheating", "dhoka"), ("cheating",), "420 406 ppc"),
+    ("Mutation / revenue", ("mutation", "intiqal", "انتقال", "revenue"), ("mutation", "revenue"), "land revenue act 1967"),
+    ("Rape / zina", ("376", "rape", "zina", "زنا"), ("rape", "zina"), "376 ppc"),
+)]
+
+
+def _topics(query):
+    q = _qn(query)
+    return [t for t in _TOPICS if any(w in q for w in t[1])]
+
+
+def _gap(topics):
+    """Only the topic NAME is counted - never the question text, which may contain a client's facts."""
+    if not topics: return
+    g = _rjs(GAP_JSON, {})
+    for t in topics: g[t[0]] = g.get(t[0], 0) + 1
+    _wjs(GAP_JSON, g)
+
+
+def gaps_list(): return sorted(({"topic": k, "count": v} for k, v in _rjs(GAP_JSON, {}).items()), key=lambda x: -x["count"])
+
+
+def _binding(court):
+    k = str(court or "").lower()
+    if "supreme court" in k: return "Supreme Court ka faisla Pakistan ki sab adalaton par paband hai (Article 189)."
+    if "high court" in k: return "High Court ka faisla apne ilaqe ki matehat adalaton par paband hai (Article 201); kisi dusre High Court ka faisla sirf rehnuma hai."
+    return ""
+
+
+def _year(r):
+    y = re.search(r"(?:19|20)\d{2}", str(r.get("citation", ""))); return int(y.group(0)) if y else 0
+
+
 def authorities(query, user_path=None, limit=8):
-    toks = set(re.findall(r"[a-z0-9]{3,}", (query or "").lower()))
-    if not toks: return []
-    need, scored = min(2, len(toks)), []
+    """Search groups: every query word is one group; a recognised topic replaces its own trigger words by ONE group of the English words the library uses
+    (so 'zamanat' finds entries that say 'bail'). Overruled entries are never offered to the AI. Supreme Court first, then newer."""
+    q, tp = _qn(query), _topics(query)
+    base = set(re.findall(r"[a-z0-9]{3,}", q))
+    for t in tp: base -= {w for w in t[1] if w in base}
+    groups = [{w} for w in base] + [set(t[2]) for t in tp]
+    sec = {w for t in tp for w in re.findall(r"[a-z0-9]{2,}", t[3])}
+    if not groups: return []
+    need, scored = min(2, len(groups)), []
     for r in index(user_path).values():
-        hay = " ".join(str(r.get(k, "")) for k in ("title", "summary", "keywords", "sections", "court")).lower()
-        s = sum(1 for t in toks if t in hay)
-        if s >= need: scored.append((s, r))
-    scored.sort(key=lambda x: -x[0])
-    return [r for _, r in scored[:limit]]
+        if str(r.get("status", "")).lower().startswith("overrul"): continue
+        strong = " ".join(str(r.get(k, "")) for k in ("title", "keywords", "sections")).lower()
+        weak = " ".join(str(r.get(k, "")) for k in ("summary", "court")).lower()
+        hit = [g for g in groups if any(w in strong or w in weak for w in g)]
+        if len(hit) < need: continue
+        s = sum(2 if any(w in strong for w in g) else 1 for g in hit) + sum(0.5 for w in sec if w in strong)
+        s += 1.5 if "supreme" in weak else 0.5 if "high court" in weak else 0
+        scored.append((s, _year(r), r))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    return [r for _, _, r in scored[:limit]]
 
 
-def authorities_block(query, user_path=None):
-    head = ("CITATION POLICY (mandatory): never cite a case, reporter citation or judgment from your own memory. "
-            "Cite case law ONLY from the VERIFIED AUTHORITIES below, copied exactly as written. ")
-    a = authorities(query, user_path)
+def authorities_block(query, user_path=None, auths=None):
+    head = ("CITATION POLICY (mandatory): never write a case name, case citation or law-report citation (PLD, SCMR, CLC, YLR, PCrLJ ...) from your own "
+            "memory or in your own words. The ONLY case law you may use is the numbered VERIFIED AUTHORITIES below, and you must refer to each one ONLY by "
+            "its tag such as [A1] - the system prints the exact citation in its place. Never change a tag or invent one. After the legal position, finish "
+            "with a short section titled 'Suggested next steps' (Kya karna chahiye): practical steps for the advocate - what to argue, which documents and "
+            "dates to check, and which authority [A#] supports which point. ")
+    a = authorities(query, user_path) if auths is None else auths
     if not a:
-        return head + ("VERIFIED AUTHORITIES: none found in the verified database for this topic. Give the statutory position and "
-                       "principles only, and write 'Precedents: to be searched on Pakistan Law Site / East Law and added after verification' "
-                       "instead of citing any case.")
+        return head + ("VERIFIED AUTHORITIES: none in the verified library for this topic. Do not cite any case. Say 'Is mauzoo par verified citation "
+                       "library mein abhi nahi hai' once, then give the statutory position and the suggested next steps.")
     return head + "VERIFIED AUTHORITIES:\n" + "\n".join(
-        f"- {r['citation']} | {r.get('title', '')} | {r.get('court', '')} | {str(r.get('summary', ''))[:350]}" for r in a)
+        f"[A{i}] {r['citation']} | {r.get('title', '')} | {r.get('court', '')} | {str(r.get('summary', ''))[:350]}" for i, r in enumerate(a, 1))
+
+
+def _fmt(r):
+    bits = [f"{r['citation']}  -  {r.get('title', '')}", "   " + " | ".join(str(r[k]) for k in ("court", "date", "bench") if r.get(k))]
+    st = str(r.get("status", "")).strip().lower()
+    if st.startswith("overrul"): bits.append("   WARNING: is faisle ko overrule kiya ja chuka hai - bharosa na karein.")
+    elif st.startswith("disting") or st.startswith("check"): bits.append("   Ehtiyat: " + ("is faisle se farq (distinguish) kiya gaya hai" if st.startswith("disting") else "dobara check kiya jana hai") + " - istemal se pehle dekh lein.")
+    bind = _binding(r.get("court"))
+    if bind: bits.append("   " + bind)
+    if r.get("summary"): bits.append("   Khulasa: " + str(r["summary"])[:500])
+    if r.get("extract"): bits.append("   Faisle ki asal ibarat" + (f" (para {r['para']})" if r.get("para") else "") + ': "' + str(r["extract"])[:700] + '"')
+    src, vb, vo = str(r.get("source", "")), str(r.get("verified_by", "")), str(r.get("verified_on", ""))
+    bits.append(f"   Zareya: {src}" + (f" | tasdeeq: {vb}" if vb else "") + (f" ({vo})" if vo else "") + (f" | {r['url']}" if r.get("url") else ""))
+    return "\n".join(b for b in bits if b.strip())
+
+
+def render(text, auths, user_path=None, query=""):
+    """[A1] tags -> the exact library citation; any other citation-looking string is flagged; the verified details are appended by the SERVER."""
+    tags, used = {f"A{i}": r for i, r in enumerate(auths, 1)}, []
+    def sub(m):
+        r = tags.get(m.group(1))
+        if not r: return ""
+        if r not in used: used.append(r)
+        return r["citation"]
+    text, rep = scrub(re.sub(r"\[(A\d{1,2})\]", sub, text or ""), user_path)
+    head = "\n\nVERIFIED AUTHORITIES (library se - AI ne nahi likhe):\n"
+    if not auths:
+        _gap(_topics(query))
+        return text + head + "Is mauzoo par verified library mein abhi koi citation nahi hai.", rep
+    rest = [r for r in auths if r not in used]
+    body = "\n\n".join(_fmt(r) for r in used) or "(AI ne inmein se kisi ka hawala nahi diya)"
+    return text + head + body + (("\n\nMutaliq (ye bhi library mein hain):\n" + "\n\n".join(_fmt(r) for r in rest)) if rest else ""), rep
 
 
 def scrub(text, user_path=None):
@@ -192,7 +318,7 @@ def verify(text, user_path=None, language="English"):
             lines.append(f"   {r['title']} | {r['court']} {r['date']}".rstrip())
             lines.append(f"   {M['source']}: {r['source']}" + (f" ({r['verified_by']})" if r["verified_by"] else ""))
             if r["summary"]: lines.append(f"   {r['summary']}")
-        else: lines.append("   " + M["open"] + ": " + " | ".join(f"{n}: {u}" for n, u in it["links"]))
+        else: pass          # not in the library: the advocate stays in the app, the admin team verifies it
     return {"status": items[0]["status"], "items": items, "report": "\n".join(lines)}
 
 
@@ -218,7 +344,8 @@ def import_text(text, source=""):
             try: rows.append(json.loads(ln))
             except ValueError: pass
     else: rows = list(csv.DictReader(io.StringIO(text)))
-    have, new, skipped = _rows_to_idx(_read_jsonl(GLOBAL_IDX)), [], 0
+    allrows = _global_rows(); have, new, skipped, full = _rows_to_idx(allrows), [], 0, False
+    size = len(json.dumps(allrows, ensure_ascii=False))
     for r in rows:
         ms = _find(str(r.get("citation", "")))
         if len(ms) != 1 or not str(r.get("title", "")).strip(): skipped += 1; continue
@@ -226,12 +353,54 @@ def import_text(text, source=""):
         if key in have: skipped += 1; continue
         r = {str(k): str(v)[:2000] for k, v in r.items() if k and v}
         r["citation"], r["source"] = shown, r.get("source") or source or "import"
-        have[key] = r; new.append(r)
+        sz = len(json.dumps(r, ensure_ascii=False)) + 2
+        if size + sz > LIB_BYTES: full = True; break
+        size += sz; have[key] = r; new.append(r)
     if new:
-        os.makedirs(DATA, exist_ok=True)
-        with _LOCK, open(GLOBAL_IDX, "a", encoding="utf-8") as f:
-            for r in new: f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    return {"added": len(new), "skipped": skipped}
+        _wjs(GLOBAL_JSON, allrows + new); _GV["ver"] += 1
+        _resolve([_norm(_find(r["citation"])[0])[0] for r in new])
+    return {"added": len(new), "skipped": skipped, **({"library_full": True} if full else {})}
+
+
+def add_global(rec, by=""):
+    """Admin team: one verified entry. 'source' (where it was verified) is mandatory."""
+    if not str(rec.get("source", "")).strip(): return False, "Zareya (source) likhein - ye kahan se tasdeeq hua (jaise Pakistan Law Site, court ki website)."
+    rec = {k: v for k, v in rec.items() if str(v or "").strip()}
+    if by: rec["verified_by"] = by
+    rec["verified_on"] = date.today().isoformat()
+    r = import_text(json.dumps(rec, ensure_ascii=False))
+    if r["added"]: return True, ""
+    return False, "Library full hai." if r.get("library_full") else "Citation ka format durust nahi, title khali hai, ya ye pehle se library mein hai."
+
+
+def search(query, user_path=None, limit=20):
+    q = (query or "").strip(); ms = _find(q)
+    if ms: rec = index(user_path).get(_norm(ms[0])[0]); return [rec] if rec else []
+    return authorities(q, user_path, limit)
+
+
+def request_cite(citation):
+    """A citation somebody tried that is not in the library: queued (once, with a counter) for the admin team."""
+    ms = _find(citation)
+    if len(ms) != 1: return
+    key, shown, meta = _norm(ms[0])
+    if not (1947 <= meta["year"] <= date.today().year): return
+    rows, today = _rjs(REQ_JSON, []), date.today().isoformat()
+    for r in rows:
+        if r.get("key") == key: r["count"], r["last"] = r.get("count", 1) + 1, today; break
+    else:
+        if len(rows) >= 500: return
+        rows.append({"key": key, "citation": shown, "count": 1, "first": today, "last": today})
+    _wjs(REQ_JSON, rows)
+
+
+def requests_list(): return sorted(_rjs(REQ_JSON, []), key=lambda r: (-r.get("count", 1), r.get("citation", "")))
+
+
+def _resolve(keys):
+    rows, ks = _rjs(REQ_JSON, []), set(keys)
+    keep = [r for r in rows if r.get("key") not in ks]
+    if len(keep) != len(rows): _wjs(REQ_JSON, keep)
 ''')      # verified citations only
 cs = _embed('court_sync', r'''"""Court sync for Punjab district courts (stdlib only).
 
@@ -788,7 +957,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v24-durable-storage", "model": MODEL, "data_dir": DATA, "storage": "upstash" if REMOTE else "disk"}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v27-fast-ai", "model": MODEL, "data_dir": DATA, "storage": "upstash" if REMOTE else "disk"}
 
 # ---------------------------------------------------------------- helpers
 # --- STORE BEGIN
@@ -870,6 +1039,7 @@ def rm(path):
     try: os.remove(path)
     except OSError: pass
 # --- STORE END
+cit.HOOK["rj"], cit.HOOK["wj"] = rj, wj          # the verified-citation library and its requests live in the same durable store
 
 def _h(t): return hashlib.sha256(t.encode()).hexdigest()
 
@@ -1174,7 +1344,7 @@ Follow standard Pakistani court drafting style and terminology.
 Prepare a complete, court-ready {g('category')} document: {g('doc_type')}
 - Court/Forum: {g('court') or blank}
 - Parties: {g('parties') or blank}
-- Reference (FIR/Law): {g('ref') or blank}
+- Reference (case / suit no., FIR no., law provisions): {g('ref') or blank}
 - Other details: {g('extra') or blank}
 - Facts & Grounds: {g('facts') or blank}{nofacts}{idnote}
 Output only the finished document (no preface, notes or markdown symbols).""", f"Draft - {g('doc_type')}"
@@ -1185,7 +1355,7 @@ Conduct legal research on Pakistani law: {g('act')}
 - Provision: {g('section')}
 - Precedents from: {g('court')}
 - Question/Facts: {g('question')}
-Give the bare-act position and key principles. For case law use ONLY the VERIFIED AUTHORITIES supplied; if none apply, say that precedents must be searched on Pakistan Law Site or East Law.""", f"Research - {g('act')}"
+Give the bare-act position and key principles. For case law use ONLY the VERIFIED AUTHORITIES supplied, referring to them by their [A#] tags; if none apply, say the verified library has nothing on this point.""", f"Research - {g('act')}"
     if r.kind == "citation":
         if not g("citation"): raise HTTPException(400, "Citation likhein.")
         return f"""{LP}
@@ -1225,19 +1395,25 @@ Use these headings: 1) Name of the law and the section title; 2) Text or substan
 Statutes are amended often, so state clearly that the advocate must verify the current text on the official Pakistan Code website before relying on it. Never invent section numbers, text or citations.""", (f"Dafa - {g('section')} {g('law')}")[:80]
     raise HTTPException(400, "Unknown kind")
 
-def call_claude(content):
-    """Har call ki hadd 110s, kul hadd 280s. Pehle thinking band, phir bari bari dusre tareeqe aur purana model."""
+def call_claude(content, progress=None):
+    """Streaming: a long draft keeps flowing instead of dying at the 110 s read timeout. Overall limit 420 s.
+    First thinking off (fast), then the other way, then the older model. progress(n) gets the number of characters written so far."""
     client = anthropic.Anthropic(api_key=API_KEY, timeout=110.0, max_retries=0)
     models = [MODEL] + (["claude-sonnet-4-6"] if MODEL != "claude-sonnet-4-6" else [])
-    deadline = time.time() + 280
+    deadline = time.time() + 420
     last = None
     for m in models:
         for extra, max_tokens in (({"thinking": {"type": "disabled"}}, 8000), ({}, 16000)):
             if time.time() > deadline:
                 raise last or RuntimeError("AI ko bohat der lag gayi")
             try:
-                res = client.messages.create(model=m, max_tokens=max_tokens, system=SYSTEM, extra_body=extra,
-                                             messages=[{"role": "user", "content": content}])
+                n = 0
+                with client.messages.stream(model=m, max_tokens=max_tokens, system=SYSTEM, extra_body=extra,
+                                            messages=[{"role": "user", "content": content}]) as stream:
+                    for piece in stream.text_stream:
+                        n += len(piece)
+                        if progress: progress(n)
+                    res = stream.get_final_message()
             except Exception as e:
                 last = e
                 print(f"[AI] {m} fail: {type(e).__name__}: {str(e)[:200]}", flush=True)
@@ -1252,13 +1428,19 @@ def call_claude(content):
 JOBS, JOBS_LOCK = {}, threading.Lock()
 
 def _run_job(jid, uid, r, content, label, lim, ckey):
+    def prog(n):
+        with JOBS_LOCK:
+            if jid in JOBS: JOBS[jid]["chars"] = n
     try:
-        text = call_claude(content)
+        text = call_claude(content, prog)
     except Exception as e:
         with JOBS_LOCK: JOBS[jid].update(status="error", code=502, detail=f"AI se jawab nahi aa saka ({type(e).__name__}): {str(e)[:220]}")
         return
     cites = []
-    if r.kind in ("draft", "research", "section", "fir"):      # flag any citation that is not in the verified index
+    if r.kind in ("draft", "research", "section"):      # AI only uses [A#] tags; the server prints the verified citations and their details
+        q = " ".join(v for v in (r.fields or {}).values() if isinstance(v, str))[:600]
+        text, cites = cit.render(text, cit.authorities(q, dpath(uid, "mycitations")), dpath(uid, "mycitations"), q)
+    elif r.kind == "fir":                                # flag any citation that is not in the verified index
         text, cites = cit.scrub(text, dpath(uid, "mycitations"))
     used = 0
     try:
@@ -1269,7 +1451,12 @@ def _run_job(jid, uid, r, content, label, lim, ckey):
             u["prompt_count"] = u.get("prompt_count", 0) + 1; used = u["prompt_count"]; wj(USERS_FILE, users)
         hist = rj(dpath(uid, "history"), [])
         hist.append({"time": datetime.now().strftime("%d-%m-%Y %H:%M"), "type": label, "result": text, "lang": r.language})
-        wj(dpath(uid, "history"), hist[-300:])
+        keep, size = [], 0                                   # newest first, at most ~1.5 MB: every save rewrites the whole list
+        for h in reversed(hist[-300:]):
+            size += len(str(h.get("result", ""))) + 200
+            if size > 1_500_000: break
+            keep.append(h)
+        wj(dpath(uid, "history"), keep[::-1])
     except Exception:
         traceback.print_exc()          # save fail ho bhi jaye to jawab user ko zaroor milay
     with JOBS_LOCK: JOBS[jid].update(status="done", data={"result": text, "type": label, "used": used, "limit": lim, "citations": cites})
@@ -1283,6 +1470,8 @@ def ai(r: AiReq, authorization: str = Header(None)):
         txt = (r.fields or {}).get("citation", "")
         if not txt.strip(): raise HTTPException(400, "Citation likhein.")
         v = cit.verify(txt, dpath(uid, "mycitations"), r.language)
+        for it in v["items"]:
+            if it["status"] == "unindexed": cit.request_cite(it["citation"])
         return {"result": v["report"], "type": "Citation Check", "used": u.get("prompt_count", 0), "limit": lim, "citations": v["items"]}
     if r.kind == "category":      # ek hi list sab ke liye: cache mein ho to free aur foran
         hit = rj(CAT_CACHE, {}).get(ckey)
@@ -1329,7 +1518,7 @@ def ai_job(jid: str, authorization: str = Header(None)):
     _, uid = current(authorization, True)
     with JOBS_LOCK: j = JOBS.get(jid)
     if not j or j["uid"] != uid: raise HTTPException(404, "Ye request nahi mili (server restart ho gaya hoga). Dobara try karein.")
-    if j["status"] == "pending": return {"status": "pending"}
+    if j["status"] == "pending": return {"status": "pending", "chars": j.get("chars", 0), "waited": int(time.time() - j["ts"])}
     with JOBS_LOCK: JOBS.pop(jid, None)
     if j["status"] == "error": raise HTTPException(j["code"], j["detail"])
     return {"status": "done", **j["data"]}
@@ -1393,7 +1582,10 @@ class CitImport(BaseModel): text: str; source: str = ""
 @app.post("/citations/verify")
 def citations_verify(r: CitVerify, authorization: str = Header(None)):
     _, uid = current(authorization)
-    return cit.verify(r.text, dpath(uid, "mycitations"), r.language)
+    v = cit.verify(r.text, dpath(uid, "mycitations"), r.language)
+    for it in v["items"]:
+        if it["status"] == "unindexed": cit.request_cite(it["citation"])
+    return v
 
 @app.post("/citations/mine")
 def citations_mine(r: CitIn, authorization: str = Header(None)):
@@ -1404,6 +1596,36 @@ def citations_mine(r: CitIn, authorization: str = Header(None)):
                                                       "verified_by": users[uid]["chamber_name"]})
     if not ok: raise HTTPException(400, msg)
     return {"ok": True}
+
+class CitSearch(BaseModel): q: str
+class CitAdd(BaseModel): citation: str; title: str; source: str; court: str = ""; date: str = ""; bench: str = ""; summary: str = ""; keywords: str = ""; sections: str = ""; url: str = ""; extract: str = ""; para: str = ""; status: str = ""
+
+@app.post("/citations/search")
+def citations_search(r: CitSearch, authorization: str = Header(None)):
+    """Search the verified library (global + this advocate's own). Nothing here comes from the AI."""
+    _, uid = current(authorization)
+    return {"results": [{k: str(x.get(k, "")) for k in ("citation", "title", "court", "date", "bench", "summary", "extract", "para", "status", "source", "verified_by", "verified_on", "url")}
+                        for x in cit.search(r.q, dpath(uid, "mycitations"))]}
+
+@app.post("/admin/citations/add")
+def admin_citations_add(r: CitAdd, authorization: str = Header(None)):
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    ok, msg = cit.add_global(dict(r), users[uid].get("chamber_name", ""))
+    if not ok: raise HTTPException(400, msg)
+    return {"ok": True}
+
+@app.post("/admin/citations/gaps")
+def admin_citations_gaps(authorization: str = Header(None)):
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    return {"gaps": cit.gaps_list()}
+
+@app.post("/admin/citations/requests")
+def admin_citations_requests(authorization: str = Header(None)):
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    return {"requests": cit.requests_list()}
 
 @app.post("/citations/import")
 def citations_import(r: CitImport, authorization: str = Header(None)):
@@ -1745,6 +1967,22 @@ small{opacity:.75}
   <button onclick="undo()">Aakhri bulk update wapas lein</button>
   <pre id="dist"></pre>
 </div>
+<div class="card" id="s6" hidden>
+  <b>Verified Citation Library (admin)</b> <small>- sirf wahi citation jo aap ne khud tasdeeq kiya</small>
+  <input id="c1" placeholder="Citation (jaise 2021 SCMR 1234)"><input id="c2" placeholder="Case ka title (parties)">
+  <input id="c3" placeholder="Court"><input id="c4" placeholder="Faisle ki tareekh">
+  <input id="c5" placeholder="Zareya - kahan se tasdeeq hua (zaroori)"><input id="c6" placeholder="Link (agar ho)">
+  <textarea id="c7" rows="3" placeholder="Khulasa (apne alfaz mein)" style="width:100%;box-sizing:border-box"></textarea>
+  <textarea id="c9" rows="3" placeholder="Faisle se asal ibarat (hu-ba-hu, jo usool batati ho)" style="width:100%;box-sizing:border-box"></textarea>
+  <input id="c10" placeholder="Para / page number">
+  <select id="c11"><option value="">Status: theek (good law)</option><option value="distinguished">Distinguished</option><option value="check">Dobara check karna hai</option><option value="overruled">Overruled</option></select>
+  <button onclick="citAdd()">Library mein add karein</button>
+  <textarea id="c8" rows="3" placeholder="Bulk: CSV (citation,title,court,date,summary,source,url) ya JSONL" style="width:100%;box-sizing:border-box"></textarea>
+  <button onclick="citImport()">Bulk import</button>
+  <button onclick="citReq()">Tasdeeq ki darkhwastein</button>
+  <button onclick="citGaps()">Library kahan khali hai</button>
+  <div id="cr"></div>
+</div>
 <div class="card" id="s5" hidden>
   <b>Advocates ke case numbers (admin)</b> <small>- naam aur phone nahi dikhte</small>
   <input id="cq" placeholder="Case no / advocate / court se dhoondein" oninput="if (CN) drawCN()">
@@ -1776,8 +2014,37 @@ async function login(){
     var d = await api('/auth/login', {identifier: $('id').value.trim(), password: $('pw').value});
     T = d.token; $('s1').hidden = true; $('s2').hidden = false;
     $('allw').hidden = !(d.user && d.user.is_admin);
-    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden; $('s4').hidden = false; $('s5').hidden = $('allw').hidden;
+    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden; $('s4').hidden = false; $('s5').hidden = $('allw').hidden; $('s6').hidden = $('allw').hidden;
     show('Login ho gaya. Ab PDF chunein.');
+  } catch (e) { show(e.message); }
+}
+async function citAdd(){
+  try {
+    await api('/admin/citations/add', {citation: $('c1').value, title: $('c2').value, court: $('c3').value, date: $('c4').value, source: $('c5').value, url: $('c6').value, summary: $('c7').value, extract: $('c9').value, para: $('c10').value, status: $('c11').value});
+    ['c1', 'c2', 'c4', 'c6', 'c7', 'c9', 'c10'].forEach(function(i){ $(i).value = ''; }); $('c11').value = '';
+    show('Library mein add ho gaya.');
+  } catch (e) { show(e.message); }
+}
+async function citImport(){
+  try { var d = await api('/citations/import', {text: $('c8').value, source: $('c5').value}); show('Add: ' + d.added + ', chhode: ' + d.skipped + (d.library_full ? ' (library full)' : '')); }
+  catch (e) { show(e.message); }
+}
+async function citGaps(){
+  try {
+    var d = await api('/admin/citations/gaps', {}), box = $('cr'); box.textContent = '';
+    if (!d.gaps.length) { box.textContent = 'Abhi koi khala nahi mila.'; return; }
+    d.gaps.forEach(function(g){ var x = document.createElement('div'); x.textContent = g.topic + ' - ' + g.count + ' dafa library mein kuch nahi mila'; box.appendChild(x); });
+  } catch (e) { show(e.message); }
+}
+async function citReq(){
+  try {
+    var d = await api('/admin/citations/requests', {}), box = $('cr'); box.textContent = '';
+    if (!d.requests.length) { box.textContent = 'Koi darkhwast nahi.'; return; }
+    d.requests.forEach(function(x){
+      var b = document.createElement('button'); b.textContent = x.citation + '  (' + x.count + ' dafa)';
+      b.onclick = function(){ $('c1').value = x.citation; };
+      box.appendChild(b);
+    });
   } catch (e) { show(e.message); }
 }
 async function caseNums(){
