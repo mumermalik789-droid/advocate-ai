@@ -198,6 +198,19 @@ def _gap(topics):
     _wjs(GAP_JSON, g)
 
 
+def coverage():
+    """Per topic: how many usable (not overruled) library entries mention its words. Fewest first."""
+    rows = [r for r in _global_rows() if not str(r.get("status", "")).lower().startswith("overrul")]
+    text = [" ".join(str(r.get(k, "")) for k in ("title", "keywords", "sections", "summary")).lower() for r in rows]
+    out = [{"topic": n, "entries": sum(1 for t in text if any(w in t for w in core))} for n, _tr, core, _s in _TOPICS]
+    return sorted(out, key=lambda x: (x["entries"], x["topic"])), len(rows)
+
+
+def recheck_list():
+    return [{"citation": r.get("citation", ""), "status": r.get("status", "")} for r in _global_rows()
+            if str(r.get("status", "")).lower().startswith(("check", "disting"))]
+
+
 def gaps_list(): return sorted(({"topic": k, "count": v} for k, v in _rjs(GAP_JSON, {}).items()), key=lambda x: -x["count"])
 
 
@@ -212,21 +225,27 @@ def _year(r):
     y = re.search(r"(?:19|20)\d{2}", str(r.get("citation", ""))); return int(y.group(0)) if y else 0
 
 
+_STOPW = {"the", "and", "for", "with", "what", "when", "how", "does", "are", "was", "can", "about", "please", "kya", "hai", "hain", "kaun", "kab", "kaise",
+          "kis", "kar", "mere", "meri", "koi", "liye", "wali", "wala", "tareeqa", "tarika", "baare", "client", "case"}
+
+
 def authorities(query, user_path=None, limit=8):
     """Search groups: every query word is one group; a recognised topic replaces its own trigger words by ONE group of the English words the library uses
     (so 'zamanat' finds entries that say 'bail'). Overruled entries are never offered to the AI. Supreme Court first, then newer."""
     q, tp = _qn(query), _topics(query)
-    base = set(re.findall(r"[a-z0-9]{3,}", q))
+    base = {w for w in re.findall(r"[a-z0-9]{3,}", q) if w not in _STOPW}
     for t in tp: base -= {w for w in t[1] if w in base}
-    groups = [{w} for w in base] + [set(t[2]) for t in tp]
+    tg = [set(t[2]) for t in tp]
+    groups = [{w} for w in base] + tg
     sec = {w for t in tp for w in re.findall(r"[a-z0-9]{2,}", t[3])}
     if not groups: return []
-    need, scored = min(2, len(groups)), []
+    need, scored = (1 if tp else min(2, len(groups))), []         # a recognised topic is enough; chat-style questions carry many filler words
     for r in index(user_path).values():
         if str(r.get("status", "")).lower().startswith("overrul"): continue
         strong = " ".join(str(r.get(k, "")) for k in ("title", "keywords", "sections")).lower()
         weak = " ".join(str(r.get(k, "")) for k in ("summary", "court")).lower()
         hit = [g for g in groups if any(w in strong or w in weak for w in g)]
+        if tp and not any(g is h for g in tg for h in hit): continue
         if len(hit) < need: continue
         s = sum(2 if any(w in strong for w in g) else 1 for g in hit) + sum(0.5 for w in sec if w in strong)
         s += 1.5 if "supreme" in weak else 0.5 if "high court" in weak else 0
@@ -936,6 +955,15 @@ MAIL_FROM = os.environ.get("MAIL_FROM", SMTP_USER)            # Brevo mein verif
 EMAIL_CONFIGURED = bool(BREVO_API_KEY or (SMTP_USER and SMTP_PASS))
 ADMIN_NAME = "Muhammad Umer"
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+FAST_MODEL = os.environ.get("CLAUDE_FAST_MODEL", "claude-haiku-5-5")                      # cheap model for the light tasks
+FAST_KINDS = {k.strip() for k in os.environ.get("FAST_KINDS", "category,section").split(",") if k.strip()}
+# USD per million tokens (input, output) - only used for the admin cost report; change here if the prices change
+PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.0, 10.0), "claude-opus-5-5": (4.0, 20.0), "claude-sonnet-4-6": (3.0, 15.0)}
+
+
+def model_for(kind):
+    """MODEL_<KIND> (e.g. MODEL_DRAFT) wins; then the light kinds use the cheap model; everything else uses CLAUDE_MODEL."""
+    return os.environ.get("MODEL_" + str(kind).upper()) or (FAST_MODEL if kind in FAST_KINDS else MODEL)
 
 DATA = os.environ.get("DATA_DIR", "data")
 os.makedirs(DATA, exist_ok=True)
@@ -957,7 +985,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v27-fast-ai", "model": MODEL, "data_dir": DATA, "storage": "upstash" if REMOTE else "disk"}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v31-admin-alerts", "model": MODEL, "data_dir": DATA, "storage": "upstash" if REMOTE else "disk"}
 
 # ---------------------------------------------------------------- helpers
 # --- STORE BEGIN
@@ -1251,6 +1279,24 @@ COLS = {"clients", "invoices", "history"}
 
 def dpath(uid, col): return f"{DATA}/{re.sub(r'[^a-z0-9]+', '_', uid.lower())}_{col}.json"
 
+CMS_MIN_DIGITS = 5          # the long number of the court's case management system (e.g. 2348059/26); FIR / local numbers are shorter
+
+
+def _cms(raw):
+    """'NNNNNNN/YY' from NNNNNNN/YY, NNNNNNN/YYYY or joined digits; None when it does not look like a Case Management System number."""
+    for n, y in sorted(cs._pairs_of(str(raw or ""))):
+        if len(str(n)) >= CMS_MIN_DIGITS: return f"{n}/{str(y)[-2:]}"
+    return None
+
+
+def _adv_cases(k):
+    rows = [c for c in rj(dpath(k, "clients"), []) if isinstance(c, dict)]
+    cases = [{"case_no": _cms(c.get("case_no")) or str(c.get("case_no") or ""), "fir": str(c.get("fir") or ""), "court": str(c.get("court") or ""),
+              "date": str(c.get("date") or ""), "stage": str(c.get("stage") or "")} for c in rows if c.get("case_no") or c.get("fir")]
+    cases.sort(key=lambda x: (x["date"] or "9999", x["case_no"]))
+    return cases, sum(1 for c in rows if not _cms(c.get("case_no"))), len(rows)
+
+
 @app.get("/data/{col}")
 def get_col(col: str, authorization: str = Header(None)):
     _, uid = current(authorization)
@@ -1261,6 +1307,17 @@ def get_col(col: str, authorization: str = Header(None)):
 def put_col(col: str, rows: list[dict], authorization: str = Header(None)):
     _, uid = current(authorization)
     if col not in COLS: raise HTTPException(404)
+    if col == "clients":
+        key = lambda c: (str(c.get("name", "")), str(c.get("fir", "")), str(c.get("case_no", "")))
+        known, seen = {key(c) for c in rj(dpath(uid, "clients"), []) if isinstance(c, dict)}, {}
+        for c in rows:
+            cn = _cms(c.get("case_no"))
+            if cn: c["case_no"] = cn
+            elif key(c) not in known:          # clients saved before this rule may stay as they are; every new one needs the number
+                raise HTTPException(400, "Naye client ke liye Case Management System ka case number zaroori hai (jaise 2348059/26) - FIR ya court ka chhota number nahi.")
+            if cn:
+                if cn in seen: raise HTTPException(400, f"Case number {cn} pehle se maujood hai (client: {seen[cn]}).")
+                seen[cn] = str(c.get("name", ""))
     wj(dpath(uid, col), rows[:5000]); return {"ok": True}
 
 # ---------------------------------------------------------------- AI
@@ -1395,11 +1452,12 @@ Use these headings: 1) Name of the law and the section title; 2) Text or substan
 Statutes are amended often, so state clearly that the advocate must verify the current text on the official Pakistan Code website before relying on it. Never invent section numbers, text or citations.""", (f"Dafa - {g('section')} {g('law')}")[:80]
     raise HTTPException(400, "Unknown kind")
 
-def call_claude(content, progress=None):
+def call_claude(content, progress=None, model=None, usage=None):
     """Streaming: a long draft keeps flowing instead of dying at the 110 s read timeout. Overall limit 420 s.
     First thinking off (fast), then the other way, then the older model. progress(n) gets the number of characters written so far."""
     client = anthropic.Anthropic(api_key=API_KEY, timeout=110.0, max_retries=0)
-    models = [MODEL] + (["claude-sonnet-4-6"] if MODEL != "claude-sonnet-4-6" else [])
+    first = model or MODEL
+    models = [first] + (["claude-sonnet-4-6"] if first != "claude-sonnet-4-6" else [])
     deadline = time.time() + 420
     last = None
     for m in models:
@@ -1419,6 +1477,9 @@ def call_claude(content, progress=None):
                 print(f"[AI] {m} fail: {type(e).__name__}: {str(e)[:200]}", flush=True)
                 continue
             text = "".join(b.text for b in res.content if getattr(b, "type", "") == "text").strip()
+            if usage and getattr(res, "usage", None):
+                try: usage(m, int(res.usage.input_tokens or 0), int(res.usage.output_tokens or 0))
+                except Exception: pass
             if text:
                 return text
             last = RuntimeError(f"AI ne khali jawab diya (stop_reason: {getattr(res, 'stop_reason', '?')})")
@@ -1427,12 +1488,27 @@ def call_claude(content, progress=None):
 # Lambay jawab ke liye job system: /ai foran job id deta hai, app /ai/job/{id} poochti rehti hai
 JOBS, JOBS_LOCK = {}, threading.Lock()
 
+_ULOCK = threading.Lock()
+
+
+def _note_usage(kind, model, tin, tout):
+    """Tokens only (no names, no text): month -> 'kind|model' -> calls / input / output."""
+    try:
+        with _ULOCK:
+            u, mo = rj(f"{DATA}/ai_usage.json", {}), date.today().strftime("%Y-%m")
+            e = u.setdefault(mo, {}).setdefault(f"{kind}|{model}", {"n": 0, "in": 0, "out": 0})
+            e["n"] += 1; e["in"] += tin; e["out"] += tout
+            wj(f"{DATA}/ai_usage.json", u)
+    except Exception:
+        traceback.print_exc()
+
+
 def _run_job(jid, uid, r, content, label, lim, ckey):
     def prog(n):
         with JOBS_LOCK:
             if jid in JOBS: JOBS[jid]["chars"] = n
     try:
-        text = call_claude(content, prog)
+        text = call_claude(content, prog, model_for(r.kind), lambda m, i, o: _note_usage(r.kind, m, i, o))
     except Exception as e:
         with JOBS_LOCK: JOBS[jid].update(status="error", code=502, detail=f"AI se jawab nahi aa saka ({type(e).__name__}): {str(e)[:220]}")
         return
@@ -1596,6 +1672,101 @@ def citations_mine(r: CitIn, authorization: str = Header(None)):
                                                       "verified_by": users[uid]["chamber_name"]})
     if not ok: raise HTTPException(400, msg)
     return {"ok": True}
+
+# --- ASSISTANT BEGIN
+ASSIST_SYSTEM = (
+    "You are 'Law Assistant', a chat helper for Pakistani advocates inside the Advocate AI app. Answer questions about Pakistani law "
+    "(criminal, civil, family, property, procedure, evidence, limitation, courts). If a question is not about law, say in one line that you only help with legal questions. "
+    "STYLE: 'through the point' - short numbered points, no long introductions, no repeated disclaimers. When the user asks what the law is on something, or how to do something "
+    "(procedure), answer in this order and skip any part that does not apply: 1) QANOON: the Act and section in one or two lines. 2) ZAROORI SHARAIT: what must exist or be proved. "
+    "3) TAREEKA: numbered steps - which court or forum, which documents are filed, what happens next, and the time limit only if you are sure. 4) EHTIYAT: one caution line. "
+    "Keep the whole answer to about 6 to 10 lines; give more detail only if the user asks. "
+    "Reply in the language given below (Urdu script, Roman Urdu or English), matching the user. "
+    "ACCURACY: name an Act and section only when you are sure; if unsure write 'section number apne bare act se verify karein'. Never invent a section, a time limit or a court. "
+    "State when the answer depends on facts, the forum or a recent amendment. "
+    "CASE LAW: never write a case name or law-report citation (PLD, SCMR, CLC, YLR, PCrLJ ...) yourself. Case law may be used ONLY through the numbered VERIFIED AUTHORITIES below, by their tag, e.g. [A1]. ")
+ASSIST_HITS, _ALOCK = [], threading.Lock()
+_PII = [(re.compile(r"\b\d{5}-?\d{7}-?\d\b"), "[CNIC]"), (re.compile(r"(?:\+92|0092|92|0)\s?3\d{2}[\s-]?\d{7}\b"), "[phone]"),
+        (re.compile(r"\b0\d{2,3}[\s-]?\d{6,8}\b"), "[phone]"), (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "[email]"), (re.compile(r"\b\d{10,}\b"), "[number]")]
+
+
+def _redact(t):
+    """Free AI services may keep what they receive: CNIC, phone numbers, e-mails and long numbers never leave the server."""
+    for rx, rp in _PII: t = rx.sub(rp, t)
+    return t
+
+
+def _assist_providers():
+    out = []
+    for p in ("ASSIST", "ASSIST2"):
+        base, key, model = os.environ.get(f"{p}_BASE_URL", "").rstrip("/"), os.environ.get(f"{p}_API_KEY", ""), os.environ.get(f"{p}_MODEL", "")
+        if p == "ASSIST" and key:
+            base = base or "https://generativelanguage.googleapis.com/v1beta/openai"       # Google's OpenAI-compatible endpoint
+            model = model or "gemini-3.5-flash-lite"
+        if base and key and model: out.append((base, key, model))
+    return out
+
+
+def _clean_msgs(msgs):
+    out = []
+    for m in (msgs or [])[-12:]:
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and str(m.get("content", "")).strip():
+            out.append({"role": m["role"], "content": _redact(str(m["content"])[:4000].strip())})
+    while out and out[0]["role"] != "user": out.pop(0)
+    return out
+
+
+def _assist_call(base, key, model, system, msgs):
+    body = json.dumps({"model": model, "messages": [{"role": "system", "content": system}] + msgs, "max_tokens": 900, "temperature": 0.3}).encode()
+    req = urllib.request.Request(base + "/chat/completions", data=body, method="POST", headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=45) as resp: d = json.loads(resp.read().decode())
+    return re.sub(r"<think>.*?</think>", "", str(d["choices"][0]["message"]["content"] or ""), flags=re.S).strip()
+
+
+class AssistIn(BaseModel): messages: list; language: str = "Roman Urdu"
+
+@app.post("/assistant/chat")
+def assistant_chat(r: AssistIn, authorization: str = Header(None)):
+    """Chat assistant on a FREE model (never Claude). Per-advocate daily limit, shared per-minute limit, PII removed, citations only from the verified library."""
+    users, uid = current(authorization)
+    prov = _assist_providers()
+    if not prov: raise HTTPException(503, "Law Assistant abhi setup nahi hua (admin Render mein ASSIST_API_KEY lagaye).")
+    msgs = _clean_msgs(r.messages)
+    if not msgs or msgs[-1]["role"] != "user": raise HTTPException(400, "Pehle apna sawal likhein.")
+    cap, today, adm = int(os.environ.get("ASSIST_DAILY", "30")), (datetime.utcnow() + timedelta(hours=5)).date().isoformat(), users[uid].get("is_admin")
+    with _ALOCK:
+        now = time.time(); ASSIST_HITS[:] = [t for t in ASSIST_HITS if now - t < 60]
+        if len(ASSIST_HITS) >= int(os.environ.get("ASSIST_RPM", "10")): raise HTTPException(429, "Abhi bohat log istemal kar rahe hain. Ek minute baad dobara likhein.")
+        use = rj(f"{DATA}/assistant_usage.json", {})
+        if use.get("day") != today: use = {"day": today, "n": {}}
+        n = int(use["n"].get(uid, 0))
+        if n >= cap and not adm: raise HTTPException(429, f"Aaj ki {cap} messages ki had poori ho gayi. Kal dobara istemal karein.")
+        use["n"][uid] = n + 1; wj(f"{DATA}/assistant_usage.json", use); ASSIST_HITS.append(now)
+    q, path = msgs[-1]["content"][:600], dpath(uid, "mycitations")
+    auths = cit.authorities(q, path)
+    block = ("VERIFIED AUTHORITIES (cite ONLY by tag such as [A1]):\n" + "\n".join(f"[A{i}] {a['citation']} | {a.get('title', '')} | {str(a.get('summary', ''))[:250]}" for i, a in enumerate(auths, 1))
+             if auths else "VERIFIED AUTHORITIES: none for this topic - do not cite any case law.")
+    system = ASSIST_SYSTEM + f"\nReply language: {r.language}.\n" + block
+    busy = False; text = ""
+    for base, key, model in prov:
+        try:
+            text = _assist_call(base, key, model, system, msgs)
+            if text: break
+        except urllib.error.HTTPError as e:
+            busy = busy or e.code == 429
+            print(f"[assistant] {model} HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}", flush=True)
+        except Exception as e:
+            print(f"[assistant] {model} fail: {type(e).__name__}: {str(e)[:200]}", flush=True)
+    if not text:
+        with _ALOCK:                                                     # a failed answer does not use up the advocate's daily limit
+            use = rj(f"{DATA}/assistant_usage.json", {})
+            if use.get("day") == today: use["n"][uid] = max(0, int(use["n"].get(uid, 1)) - 1); wj(f"{DATA}/assistant_usage.json", use)
+        raise HTTPException(429 if busy else 503, "Free AI abhi busy hai (limit). Thori der baad dobara likhein." if busy else "Assistant abhi jawab nahi de saka. Thori der baad try karein.")
+    if auths: text, _ = cit.render(text, auths, path, q)
+    else:
+        text, _ = cit.scrub(text, path); cit._gap(cit._topics(q))
+    return {"reply": text, "left": None if adm else max(0, cap - n - 1)}
+# --- ASSISTANT END
 
 class CitSearch(BaseModel): q: str
 class CitAdd(BaseModel): citation: str; title: str; source: str; court: str = ""; date: str = ""; bench: str = ""; summary: str = ""; keywords: str = ""; sections: str = ""; url: str = ""; extract: str = ""; para: str = ""; status: str = ""
@@ -1868,16 +2039,95 @@ def admin_cases_numbers(authorization: str = Header(None)):
     out = []
     for k, u in users.items():
         if u.get("is_admin"): continue
-        rows = [c for c in rj(dpath(k, "clients"), []) if isinstance(c, dict)]
-        cases = [{"case_no": str(c.get("case_no") or ""), "fir": str(c.get("fir") or ""), "court": str(c.get("court") or ""),
-                  "date": str(c.get("date") or ""), "stage": str(c.get("stage") or "")} for c in rows if c.get("case_no") or c.get("fir")]
-        out.append({"advocate": str(u.get("chamber_name", "")), "clients": len(rows), "without_number": len(rows) - len(cases), "cases": cases})
+        cases, missing, total = _adv_cases(k)
+        out.append({"id": k, "advocate": str(u.get("chamber_name", "")), "clients": total, "without_number": missing, "cases": cases})
     out.sort(key=lambda a: a["advocate"].lower())
     try:                                                              # who looked, and when - kept so the access can be shown to advocates
         lg = rj(f"{DATA}/_admin_views.json", []); lg.append({"at": datetime.utcnow().isoformat() + "Z", "admin": uid, "what": "cases/numbers"})
         wj(f"{DATA}/_admin_views.json", lg[-500:])
     except Exception: pass
     return {"advocates": out, "total_cases": sum(len(a["cases"]) for a in out)}
+
+@app.post("/admin/usage")
+def admin_usage(authorization: str = Header(None)):
+    """Admin only: AI calls and the estimated cost (USD) per month, task kind and model."""
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    out = {}
+    for mo, d in sorted(rj(f"{DATA}/ai_usage.json", {}).items())[-3:]:
+        rows, total = [], 0.0
+        for k, e in sorted(d.items()):
+            kind, model = k.split("|", 1); p = PRICES.get(model)
+            usd = round(e["in"] / 1e6 * p[0] + e["out"] / 1e6 * p[1], 4) if p else None
+            total += usd or 0
+            rows.append({"kind": kind, "model": model, "calls": e["n"], "input_tokens": e["in"], "output_tokens": e["out"], "usd": usd})
+        out[mo] = {"rows": rows, "total_usd": round(total, 4)}
+    return {"months": out, "models_in_use": {"default": MODEL, "light_tasks": FAST_MODEL, "light_kinds": sorted(FAST_KINDS)}}
+
+class AdvId(BaseModel): id: str
+
+@app.post("/admin/alerts")
+def admin_alerts(authorization: str = Header(None)):
+    """Admin only: cases that need the admin's update NOW - hearing today, or passed with no new date (red) and tomorrow (orange).
+    Grouped by district / court so the admin knows which cause list to pull. Case numbers only: no client names, no phone numbers."""
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    today = (datetime.utcnow() + timedelta(hours=5)).date()
+    t0, t1, oldest = today.isoformat(), (today + timedelta(days=1)).isoformat(), (today - timedelta(days=30)).isoformat()
+    groups, old, nocms = {}, 0, 0
+    for k, u in users.items():
+        if u.get("is_admin"): continue
+        for c in rj(dpath(k, "clients"), []):
+            if not isinstance(c, dict): continue
+            d = str(c.get("date") or "")
+            if not d or d > t1: continue                         # no date, or later than tomorrow: nothing to do yet
+            state = "aaj" if d == t0 else "kal" if d == t1 else "guzri"
+            if state == "guzri" and d < oldest: old += 1; continue   # very old: probably finished, only counted
+            cn = _cms(c.get("case_no"))
+            nocms += 0 if cn else 1
+            dist = (cs.district_of(c) or "").title()
+            g = groups.setdefault(dist or str(c.get("court") or "")[:40] or "Court nahi likha", {"aaj": 0, "guzri": 0, "kal": 0, "cases": []})
+            g[state] += 1
+            g["cases"].append({"id": k, "advocate": str(u.get("chamber_name", "")), "case_no": cn or "", "fir": str(c.get("fir") or ""),
+                               "court": str(c.get("court") or ""), "date": d, "state": state})
+    order = {"aaj": 0, "guzri": 1, "kal": 2}
+    out = []
+    for name, g in groups.items():
+        g["cases"].sort(key=lambda x: (order[x["state"]], x["case_no"] or "~"))
+        out.append({"group": name, **g, "hint": f"{name} ki cause list /board se upload karein - ye cases khud update ho jayenge."})
+    out.sort(key=lambda g: -(g["aaj"] + g["guzri"] + g["kal"] * 0.1))
+    return {"today": t0, "red": sum(g["aaj"] + g["guzri"] for g in out), "orange": sum(g["kal"] for g in out), "no_case_no": nocms, "older_than_30_days": old, "groups": out}
+
+@app.post("/admin/library/todo")
+def admin_library_todo(authorization: str = Header(None)):
+    """Admin only: what to do in the verified library today, most useful first."""
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    reqs, gaps, (cov, total), recheck = cit.requests_list(), cit.gaps_list(), cit.coverage(), cit.recheck_list()
+    thin = [x for x in cov if x["entries"] < 5]
+    tasks = []
+    if reqs: tasks.append({"priority": 1, "title": f"Lawyers ne {len(reqs)} citation check kiye jo library mein nahi hain",
+                           "how": "Har ek ko apni subscription ya court ki website par dekh kar 'Library mein add karein' se add karein (zareya zaroor likhein). Add hote hi darkhwast khud band ho jati hai.",
+                           "items": [f"{r['citation']} - {r.get('count', 1)} dafa" for r in reqs[:15]]})
+    if gaps: tasks.append({"priority": 2, "title": f"{len(gaps)} topics par lawyers ko library se jawab nahi mila",
+                           "how": "Har topic ke liye 5 se 10 sab se mashhoor, khud tasdeeq kiye hue faisle add karein (Supreme Court pehle). Faisle ki asal ibarat aur para zaroor likhein.",
+                           "items": [f"{g['topic']} - {g['count']} dafa" for g in gaps[:15]]})
+    if thin: tasks.append({"priority": 3, "title": f"{len(thin)} topics mein 5 se kam entries hain",
+                           "how": "Pehle wo topics bharein jin mein 0 hai. Fehrist: backend\\library_topics.txt.", "items": [f"{x['topic']} - {x['entries']} entries" for x in thin[:15]]})
+    if recheck: tasks.append({"priority": 4, "title": f"{len(recheck)} entries 'dobara check' ya 'distinguished' hain",
+                              "how": "Un faislon ko dobara dekhein: ab bhi theek hain, ya overruled hue? Status update karein.", "items": [f"{x['citation']} - {x['status']}" for x in recheck[:15]]})
+    tasks.append({"priority": 9, "title": "Roz ka mamool (10 minute)", "how": "1) Darkhwastein dekhein aur add karein. 2) 'Library kahan khali hai' dekhein. 3) Ek topic ki 2 se 3 nayi entries add karein.", "items": []})
+    return {"library_entries": total, "tasks": tasks}
+
+@app.post("/admin/cases/of")
+def admin_cases_of(r: AdvId, authorization: str = Header(None)):
+    """Admin only: every case number of ONE advocate (no client names, no phone numbers)."""
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    u = users.get(r.id)
+    if not u or u.get("is_admin"): raise HTTPException(404, "Advocate nahi mila.")
+    cases, missing, total = _adv_cases(r.id)
+    return {"advocate": str(u.get("chamber_name", "")), "clients": total, "without_number": missing, "cases": cases}
 
 @app.post("/admin/cases/undo")
 def admin_cases_undo(authorization: str = Header(None)):
@@ -1967,6 +2217,16 @@ small{opacity:.75}
   <button onclick="undo()">Aakhri bulk update wapas lein</button>
   <pre id="dist"></pre>
 </div>
+<div class="card" id="s8" hidden style="border:2px solid #c62828">
+  <b style="color:#c62828">🔴 Update hone wale cases (admin)</b> <small>- sirf case number, naam/phone nahi</small>
+  <button onclick="alerts()">Dobara dekhein</button>
+  <div id="al"></div>
+</div>
+<div class="card" id="s7" hidden>
+  <b>AI ka kharch (admin)</b> <small>- sirf tokens ginti hai, kisi ka matan nahi</small>
+  <button onclick="usage()">Is mahine ka kharch dikhayein</button>
+  <div id="us"></div>
+</div>
 <div class="card" id="s6" hidden>
   <b>Verified Citation Library (admin)</b> <small>- sirf wahi citation jo aap ne khud tasdeeq kiya</small>
   <input id="c1" placeholder="Citation (jaise 2021 SCMR 1234)"><input id="c2" placeholder="Case ka title (parties)">
@@ -1981,6 +2241,7 @@ small{opacity:.75}
   <button onclick="citImport()">Bulk import</button>
   <button onclick="citReq()">Tasdeeq ki darkhwastein</button>
   <button onclick="citGaps()">Library kahan khali hai</button>
+  <button onclick="libTodo()">Library ka kaam (aaj kya karna hai)</button>
   <div id="cr"></div>
 </div>
 <div class="card" id="s5" hidden>
@@ -2014,7 +2275,7 @@ async function login(){
     var d = await api('/auth/login', {identifier: $('id').value.trim(), password: $('pw').value});
     T = d.token; $('s1').hidden = true; $('s2').hidden = false;
     $('allw').hidden = !(d.user && d.user.is_admin);
-    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden; $('s4').hidden = false; $('s5').hidden = $('allw').hidden; $('s6').hidden = $('allw').hidden;
+    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden; $('s4').hidden = false; $('s5').hidden = $('allw').hidden; $('s6').hidden = $('allw').hidden; $('s7').hidden = $('allw').hidden; $('s8').hidden = $('allw').hidden; if (!$('allw').hidden) alerts();
     show('Login ho gaya. Ab PDF chunein.');
   } catch (e) { show(e.message); }
 }
@@ -2028,6 +2289,47 @@ async function citAdd(){
 async function citImport(){
   try { var d = await api('/citations/import', {text: $('c8').value, source: $('c5').value}); show('Add: ' + d.added + ', chhode: ' + d.skipped + (d.library_full ? ' (library full)' : '')); }
   catch (e) { show(e.message); }
+}
+async function alerts(){
+  try {
+    var d = await api('/admin/alerts', {}), box = $('al'); box.textContent = '';
+    var h = document.createElement('div'); h.style.cssText = 'font-weight:700;color:' + (d.red ? '#c62828' : '#2e7d32');
+    h.textContent = d.red ? ('🔴 ' + d.red + ' cases: peshi aaj hai ya guzar chuki (agli tareekh nahi mili)') : 'Koi red alert nahi';
+    box.appendChild(h);
+    var s = document.createElement('div'); s.textContent = '🟠 Kal ki peshi: ' + d.orange + ' | Bina case number: ' + d.no_case_no + ' | 30 din se purani (alert mein nahi): ' + d.older_than_30_days; box.appendChild(s);
+    d.groups.forEach(function(g){
+      var t = document.createElement('div'); t.style.cssText = 'margin-top:12px;font-weight:700';
+      t.textContent = g.group + ' - aaj ' + g.aaj + ', guzri ' + g.guzri + ', kal ' + g.kal; box.appendChild(t);
+      var hn = document.createElement('div'); hn.style.fontSize = '12px'; hn.textContent = g.hint; box.appendChild(hn);
+      g.cases.forEach(function(c){
+        var x = document.createElement('div'); x.style.color = c.state === 'kal' ? '#ef6c00' : '#c62828';
+        x.textContent = (c.state === 'kal' ? '🟠 ' : '🔴 ') + (c.case_no || '(case no nahi)') + (c.fir ? ' | FIR ' + c.fir : '') + ' | ' + c.advocate + ' | ' + c.court + ' | ' + c.date + ' | ' + c.state;
+        box.appendChild(x);
+      });
+    });
+  } catch (e) { show(e.message); }
+}
+async function libTodo(){
+  try {
+    var d = await api('/admin/library/todo', {}), box = $('cr'); box.textContent = '';
+    var h = document.createElement('div'); h.style.fontWeight = '700'; h.textContent = 'Library mein abhi ' + d.library_entries + ' entries hain'; box.appendChild(h);
+    d.tasks.forEach(function(t){
+      var a = document.createElement('div'); a.style.cssText = 'margin-top:12px;font-weight:700'; a.textContent = t.priority + '. ' + t.title; box.appendChild(a);
+      var b = document.createElement('div'); b.style.fontSize = '13px'; b.textContent = t.how; box.appendChild(b);
+      t.items.forEach(function(i){ var x = document.createElement('div'); x.textContent = '- ' + i; box.appendChild(x); });
+    });
+  } catch (e) { show(e.message); }
+}
+async function usage(){
+  try {
+    var d = await api('/admin/usage', {}), box = $('us'); box.textContent = '';
+    var h = document.createElement('div'); h.textContent = 'Default model: ' + d.models_in_use.default + ' | halke kaam (' + d.models_in_use.light_kinds.join(', ') + '): ' + d.models_in_use.light_tasks; box.appendChild(h);
+    var ms = Object.keys(d.months); if (!ms.length) { box.appendChild(document.createTextNode('Abhi koi AI istemal darj nahi.')); return; }
+    ms.forEach(function(mo){
+      var t = document.createElement('div'); t.style.cssText = 'margin-top:12px;font-weight:700'; t.textContent = mo + ' - kul takreeban $' + d.months[mo].total_usd; box.appendChild(t);
+      d.months[mo].rows.forEach(function(r){ var x = document.createElement('div'); x.textContent = r.kind + ' | ' + r.model + ' | ' + r.calls + ' dafa | in ' + r.input_tokens + ' out ' + r.output_tokens + ' | ' + (r.usd === null ? 'qeemat maloom nahi' : '$' + r.usd); box.appendChild(x); });
+    });
+  } catch (e) { show(e.message); }
 }
 async function citGaps(){
   try {
@@ -2170,9 +2472,14 @@ def board_page():
 def admin_users(authorization: str = Header(None)):
     users, uid = current(authorization)
     if not users[uid].get("is_admin"): raise HTTPException(403)
-    return [{"id": k, **profile(v), "devices": len(v.get("sessions", {})), "email_verified": bool(v.get("email_verified")),
-             "name": v.get("name", ""), "phone": v.get("phone", ""), "city": v.get("city", ""), "bar_no": v.get("bar_no", ""),
-             "created": v.get("created", "")} for k, v in users.items() if k != "admin"]
+    out = []
+    for k, v in users.items():
+        if k == "admin": continue
+        _, missing, total = _adv_cases(k)
+        out.append({"id": k, **profile(v), "devices": len(v.get("sessions", {})), "email_verified": bool(v.get("email_verified")),
+                    "name": v.get("name", ""), "phone": v.get("phone", ""), "city": v.get("city", ""), "bar_no": v.get("bar_no", ""),
+                    "created": v.get("created", ""), "cases": total, "no_case_no": missing})
+    return out
 
 class AdminSet(BaseModel): id: str; package: str | None = None; expiry_date: str | None = None; add_days: int = 0; disabled: bool | None = None; email_verified: bool | None = None
 
