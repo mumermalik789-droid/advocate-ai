@@ -123,12 +123,16 @@ def _read_jsonl(path):
     return out
 
 
+def _official_key(ref): return "OFF|" + re.sub(r"[^a-z0-9]+", "", str(ref).lower())
+
+
 def _rows_to_idx(rows):
     idx = {}
     for r in rows:
         if not isinstance(r, dict): continue
         ms = _find(str(r.get("citation", "")))
         if len(ms) == 1: idx[_norm(ms[0])[0]] = r
+        elif str(r.get("official", "")) == "1" and str(r.get("citation", "")).strip(): idx[_official_key(r["citation"])] = r      # official judgment, no law-report citation
     return idx
 
 
@@ -275,7 +279,7 @@ def _fmt(r):
     elif st.startswith("disting") or st.startswith("check"): bits.append("   Ehtiyat: " + ("is faisle se farq (distinguish) kiya gaya hai" if st.startswith("disting") else "dobara check kiya jana hai") + " - istemal se pehle dekh lein.")
     bind = _binding(r.get("court"))
     if bind: bits.append("   " + bind)
-    if r.get("summary"): bits.append("   Khulasa: " + str(r["summary"])[:500])
+    if r.get("summary"): bits.append(("   Khulasa (AI ne likha, admin ne dekha): " if r.get("ai_assisted") else "   Khulasa: ") + str(r["summary"])[:500])
     if r.get("extract"): bits.append("   Faisle ki asal ibarat" + (f" (para {r['para']})" if r.get("para") else "") + ': "' + str(r["extract"])[:700] + '"')
     src, vb, vo = str(r.get("source", "")), str(r.get("verified_by", "")), str(r.get("verified_on", ""))
     bits.append(f"   Zareya: {src}" + (f" | tasdeeq: {vb}" if vb else "") + (f" ({vo})" if vo else "") + (f" | {r['url']}" if r.get("url") else ""))
@@ -387,6 +391,15 @@ def add_global(rec, by=""):
     rec = {k: v for k, v in rec.items() if str(v or "").strip()}
     if by: rec["verified_by"] = by
     rec["verified_on"] = date.today().isoformat()
+    ref = str(rec.get("citation", "")).strip()
+    if len(_find(ref)) != 1 and str(rec.get("official", "")) == "1":      # official judgment without a PLD/SCMR citation: identified by its case reference
+        if len(ref) < 8 or not str(rec.get("title", "")).strip(): return False, "Case reference aur title zaroori hain."
+        allrows = _global_rows()
+        if _official_key(ref) in _rows_to_idx(allrows): return False, "Ye faisla pehle se library mein hai."
+        rec = {str(k): str(v)[:2000] for k, v in rec.items()}
+        if len(json.dumps(allrows + [rec], ensure_ascii=False)) > LIB_BYTES: return False, "Library full hai."
+        _wjs(GLOBAL_JSON, allrows + [rec]); _GV["ver"] += 1
+        return True, ""
     r = import_text(json.dumps(rec, ensure_ascii=False))
     if r["added"]: return True, ""
     return False, "Library full hai." if r.get("library_full") else "Citation ka format durust nahi, title khali hai, ya ye pehle se library mein hai."
@@ -985,7 +998,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v31-admin-alerts", "model": MODEL, "data_dir": DATA, "storage": "upstash" if REMOTE else "disk"}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v35-court-hub", "model": MODEL, "data_dir": DATA, "storage": "upstash" if REMOTE else "disk"}
 
 # ---------------------------------------------------------------- helpers
 # --- STORE BEGIN
@@ -1378,6 +1391,228 @@ TEMPLATE_INSTR = ("IMPORTANT: The advocate's own sample draft is attached as TEM
                   "and the same language, script and legal register as the template. Replace ONLY the case-specific details with the facts "
                   "given below and do not copy the template's own names, dates or numbers.")
 
+# --- FACTS BEGIN
+CHECK_MARK = "\n\n=====JAANCH====="              # everything after this line is the server's checking report: it is not part of the document that is exported / copied
+_DIG = {**{0x660 + i: 48 + i for i in range(10)}, **{0x6F0 + i: 48 + i for i in range(10)}}
+_MONTHS = {m: i for i, m in enumerate(["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"], 1)}
+_ACTS = r"(?:PPC|P\.\s?P\.\s?C\.?|Pakistan\s+Penal\s+Code|Penal\s+Code|CrPC|Cr\.\s?P\.\s?C\.?|Code\s+of\s+Criminal\s+Procedure|CPC|C\.\s?P\.\s?C\.?|Code\s+of\s+Civil\s+Procedure|CNSA|CNS\s+Act|Control\s+of\s+Narcotic\s+Substances\s+Act|Qanun-e-Shahadat|QSO|Arms\s+Ordinance|Arms\s+Act|ATA|Anti-Terrorism\s+Act)"
+_TOK = r"\d{1,4}(?:\s?-\s?[A-Za-z](?![A-Za-z])|[A-Za-z](?![A-Za-z]))?(?:\s?\(\s?[ivxlc\d]{1,4}\s?\))*"
+_LIST = rf"{_TOK}(?:\s*(?:,|/|&|\band\b|\bor\b)\s*{_TOK})*"
+_SEC_HEAD = re.compile(r"(?:\bu\s?/\s?ss?\b\.?|\bsections?\b|\bsec\.?|\bss\.|\bs\.(?=\s?\d)|دفعہ|دفعات|دفعه)\s*[:\-]?\s*", re.I)
+_SEC_ACT = re.compile(rf"(?<![\w/.-])({_LIST})\s*(?:of\s+(?:the\s+)?)?({_ACTS})(?![A-Za-z])", re.I)
+_ACT_AFTER = re.compile(rf"\s*(?:of\s+(?:the\s+)?)?({_ACTS})(?![A-Za-z])", re.I)
+_LIST_RX = re.compile(_LIST)
+_ART = re.compile(r"\b(?:article|art\.)\s*(\d{1,3}[A-Za-z]?)", re.I)
+_ORDER = re.compile(r"\border\s+([ivxlc]+|\d{1,2})\b(?:\s*,?\s*rules?\s*(\d{1,3}(?:\s*(?:&|and|,)\s*\d{1,3})*))?", re.I)
+_D_ISO = re.compile(r"\b(\d{4})\s?-\s?(\d{1,2})\s?-\s?(\d{1,2})\b")
+_D_NUM = re.compile(r"\b(\d{1,2})\s?[-/.]\s?(\d{1,2})\s?[-/.]\s?(\d{4}|\d{2})\b")
+_D_TXT = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?([A-Za-z]{3,9})\.?,?\s+(\d{4})\b")
+_D_TXT2 = re.compile(r"\b([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b")
+
+
+def _d(s): return str(s or "").translate(_DIG)
+
+
+def _iso(y, m, d):
+    try: return date(int(y), int(m), int(d)).isoformat()
+    except ValueError: return None
+
+
+def _mon(name):
+    n = name.lower()
+    return next((v for k, v in _MONTHS.items() if k == n or (len(n) >= 3 and k.startswith(n[:3]) and len(n) <= len(k))), None)
+
+
+def _num_date(a, b, y):
+    month, day = (b, a) if int(b) <= 12 else (a, b)          # dd-mm-yyyy; if the middle number cannot be a month it is mm-dd-yyyy
+    return _iso(y if len(y) == 4 else "20" + y, month, day)
+
+
+def find_dates(text):
+    """(set of ISO dates, text with the dates blanked out). Reads 17-03-2021, 17/3/21, 2021-03-17, 17 March 2021, March 17, 2021."""
+    found, t = set(), str(text)
+    for rx, fn in ((_D_ISO, lambda m: _iso(m[1], m[2], m[3])), (_D_NUM, lambda m: _num_date(m[1], m[2], m[3])),
+                   (_D_TXT, lambda m: _iso(m[3], _mon(m[2]) or 0, m[1])), (_D_TXT2, lambda m: _iso(m[3], _mon(m[1]) or 0, m[2]))):
+        for m in rx.finditer(t):
+            iso = fn(m)
+            if iso: found.add(iso)
+        t = rx.sub(" ", t)
+    return found, t
+
+
+def _skey(tok): return re.sub(r"[^0-9a-z]", "", tok.lower())
+
+
+def _act(a):
+    a = re.sub(r"[\s.]", "", a).lower()
+    return ("PPC" if a in ("ppc", "pakistanpenalcode", "penalcode") else "CrPC" if a in ("crpc", "codeofcriminalprocedure") else "CPC" if a in ("cpc", "codeofcivilprocedure")
+            else "CNSA" if a in ("cnsa", "cnsact", "controlofnarcoticsubstancesact") else "QSO" if a in ("qanun-e-shahadat", "qso") else "ARMS" if a.startswith("arms") else "ATA" if a in ("ata", "anti-terrorismact") else a.upper())
+
+
+def find_sections(text):
+    """([{'sec': '337-F(i)', 'act': 'PPC' or '', 'key': '337fi'}], text with them blanked out) from 'u/s 302/34 PPC', 'sections 324, 337-F(i)', '302 PPC', 'دفعہ 302' ..."""
+    t, out, spans = str(text), [], []
+    def add(listtxt, act, a, b):
+        for tok in re.findall(_TOK, listtxt):
+            tok = re.sub(r"\s+", "", tok)
+            if tok and tok.strip("-"): out.append({"sec": tok, "act": _act(act) if act else "", "key": _skey(tok)})
+        spans.append((a, b))
+    for m in _SEC_ACT.finditer(t): add(m.group(1), m.group(2), m.start(1), m.end())
+    for h in _SEC_HEAD.finditer(t):
+        lm = _LIST_RX.match(t, h.end())
+        if not lm or any(a <= lm.start() < b for a, b in spans): continue
+        am = _ACT_AFTER.match(t, lm.end())
+        add(lm.group(0), am.group(1) if am else "", h.start(), am.end() if am else lm.end())
+    for a, b in sorted(spans, reverse=True): t = t[:a] + " " + t[b:]
+    seen, uniq = set(), []
+    for x in out:
+        if (x["act"], x["key"]) not in seen: seen.add((x["act"], x["key"])); uniq.append(x)
+    return uniq, t
+
+
+def find_refs(text):
+    """Articles of the Constitution and CPC orders/rules: legal references like sections. -> ({key: shown}, text without them)"""
+    t, refs = str(text), {}
+    for m in _ART.finditer(t): refs["art" + _skey(m.group(1))] = "Article " + m.group(1)
+    for m in _ORDER.finditer(t):
+        r = re.sub(r"\s+", "", m.group(2) or "")
+        refs[_skey("o" + m.group(1) + "r" + r)] = "Order " + m.group(1).upper() + ((" Rule " + m.group(2).strip()) if m.group(2) else "")
+    return refs, _ORDER.sub(" ", _ART.sub(" ", t))
+
+
+def fact_items(text):
+    t = _d(text)
+    dates, t = find_dates(t)
+    refs, t = find_refs(t)            # before sections, so "Order XXXIX Rule 1 CPC" is not read as section 1
+    secs, t = find_sections(t)
+    nums = set()
+    for n in re.findall(r"\b\d[\d,]*\b", t):
+        n = n.replace(",", "").lstrip("0") or "0"
+        if len(n) >= 3 and not (len(n) == 4 and 1947 <= int(n) <= 2100): nums.add(n)
+    return {"dates": dates, "numbers": nums, "sections": {x["key"]: ("S." + x["sec"] + (" " + x["act"] if x["act"] else "")) for x in secs}, "refs": refs}
+
+
+def guard_report(output, source, facts=True):
+    """What the AI wrote vs what the advocate supplied. Dates and numbers that were not supplied are red; sections / articles the AI added on its own are yellow."""
+    o, s = fact_items(output), fact_items(source)
+    new_prov = {**{k: v for k, v in o["sections"].items() if k not in s["sections"]}, **{k: v for k, v in o["refs"].items() if k not in s["refs"]}}
+    rep = {"new_provisions": sorted(new_prov.values()), "facts_checked": bool(facts)}
+    if facts:
+        rep.update(new_dates=sorted(o["dates"] - s["dates"]), new_numbers=sorted(o["numbers"] - s["numbers"]),
+                   missing_dates=sorted(s["dates"] - o["dates"]), missing_numbers=sorted(s["numbers"] - o["numbers"]),
+                   missing_provisions=sorted(s["sections"][k] for k in s["sections"] if k not in o["sections"]))
+    rep["red"] = len(rep.get("new_dates", [])) + len(rep.get("new_numbers", []))
+    rep["yellow"] = len(rep["new_provisions"])
+    rep["missing"] = len(rep.get("missing_dates", [])) + len(rep.get("missing_numbers", [])) + len(rep.get("missing_provisions", []))
+    return rep
+
+
+def guard_text(rep):
+    L = [CHECK_MARK, "(Ye jaanch server ne ki hai, AI ne nahi. Ye hissa Word / copy / share mein shamil nahi hota.)"]
+    if rep["facts_checked"]:
+        if rep["new_dates"]: L.append("❌ Ye tareekhen jawab mein hain magar aap ke diye hue input mein nahi thin: " + ", ".join(rep["new_dates"]))
+        if rep["new_numbers"]: L.append("❌ Ye raqam / number jawab mein hain magar aap ke input mein nahi thay: " + ", ".join(rep["new_numbers"]))
+        if not rep["red"]: L.append("✅ Jawab mein koi nayi tareekh ya raqam nahi jo aap ke input mein na ho.")
+    else: L.append("ℹ Tasveer wale kaghazat se liye gaye facts ki jaanch nahi ho sakti - tareekhein aur raqam khud mila lein.")
+    if rep["new_provisions"]: L.append("⚠ Ye dafaat / qawanin AI ne khud likhe (input mein nahi thay) - apne bare act se verify karein: " + ", ".join(rep["new_provisions"]))
+    miss = rep.get("missing_dates", []) + rep.get("missing_numbers", []) + rep.get("missing_provisions", [])
+    if miss: L.append("ℹ Aap ke input ki ye cheezein jawab mein nazar nahi aayin: " + ", ".join(miss))
+    return "\n".join(L)
+
+
+# ---- Dafa table: punishment / bailable / cognizable ... come ONLY from entries the admin team verified, never from the AI's memory
+DAFA_JSON, DAFA_REQ = f"{DATA}/dafa_table.json", f"{DATA}/dafa_requests.json"
+DAFA_FIELDS = ("act", "section", "title", "punishment", "bailable", "cognizable", "compoundable", "court", "notes", "source")
+
+
+def dafa_rows(): return rj(DAFA_JSON, [])
+
+
+def dafa_add(rec, by=""):
+    r = {k: str(rec.get(k, "")).strip()[:600] for k in DAFA_FIELDS}
+    if not (r["act"] and r["section"] and r["title"]): return False, "Act, section aur dafa ka naam zaroori hain."
+    if not r["source"]: return False, "Zareya (source) likhein - ye maloomat kahan se tasdeeq hui (jaise Pakistan Code website)."
+    if not (r["punishment"] or r["bailable"] or r["cognizable"]): return False, "Saza, bailable ya cognizable mein se kam az kam ek likhein."
+    key = (_act(r["act"]), _skey(r["section"])); rows = dafa_rows()
+    if any((_act(x["act"]), _skey(x["section"])) == key for x in rows): return False, "Ye dafa pehle se table mein hai."
+    if len(rows) >= 3000: return False, "Table full hai."
+    r.update(act=_act(r["act"]), verified_by=by, verified_on=date.today().isoformat())
+    wj(DAFA_JSON, rows + [r]); _resolve_dafa([key]); return True, ""
+
+
+def dafa_import(text, by=""):
+    import csv, io as _io
+    added = skipped = 0
+    for row in csv.DictReader(_io.StringIO(text or "")):
+        ok_, _ = dafa_add({k: (row.get(k) or "") for k in DAFA_FIELDS}, by)
+        added, skipped = added + ok_, skipped + (not ok_)
+    return {"added": added, "skipped": skipped}
+
+
+def dafa_lookup(items):
+    rows, found, missing = dafa_rows(), [], []
+    for it in items:
+        hit = [r for r in rows if _skey(r["section"]) == it["key"] and (not it["act"] or _act(r["act"]) == it["act"])]
+        if hit: found += [r for r in hit if r not in found]
+        else: missing.append(it)
+    return found, missing
+
+
+def _resolve_dafa(keys):
+    rq = rj(DAFA_REQ, {}); n = len(rq)
+    for _a, k in keys:
+        for x in [x for x in rq if x.split("|", 1)[1] == k]: rq.pop(x)
+    if len(rq) != n: wj(DAFA_REQ, rq)
+
+
+def dafa_requests():
+    return sorted(({"section": v["section"], "act": v["act"], "count": v["count"]} for v in rj(DAFA_REQ, {}).values()), key=lambda x: -x["count"])
+
+
+def _dafa_note(missing):
+    if not missing: return
+    rq = rj(DAFA_REQ, {})
+    for it in missing:
+        k = f"{it['act']}|{it['key']}"
+        if k in rq: rq[k]["count"] += 1
+        elif len(rq) < 300: rq[k] = {"section": it["sec"], "act": it["act"], "count": 1}
+    wj(DAFA_REQ, rq)
+
+
+def _dafa_line(r):
+    return (f"{r['act']} {r['section']} - {r['title']}: saza: {r['punishment'] or '-'} | bailable: {r['bailable'] or '-'} | cognizable: {r['cognizable'] or '-'} | "
+            f"compoundable: {r['compoundable'] or '-'} | court: {r['court'] or '-'} (zareya: {r['source']}; tasdeeq: {r.get('verified_by', '')} {r.get('verified_on', '')})")
+
+
+def dafa_block(text, note=True):
+    """Table details for every section mentioned in the text. Sections that are not in the table are listed and queued for the admin team."""
+    items, _ = find_sections(_d(text))
+    if not items: return ""
+    found, missing = dafa_lookup(items)
+    if note: _dafa_note(missing)
+    out = "\n\nDAFA TABLE (admin ne tasdeeq kiye hue - AI ki yaadasht nahi):"
+    out += ("\n" + "\n".join(_dafa_line(r) for r in found)) if found else "\n(In dafaat ki tafseel abhi table mein nahi.)"
+    if missing: out += "\nTable mein nahi (admin ko bhej diya gaya, tab tak apne bare act se verify karein): " + ", ".join((x["act"] + " " if x["act"] else "") + "S." + x["sec"] for x in missing)
+    return out
+
+
+def fir_facts_prompt(text):
+    """Facts read from the FIR by plain code (no AI) + the verified table rows, handed to the AI as the only allowed source for them."""
+    t = _d(text); dates, _ = find_dates(t); items, _ = find_sections(t)
+    no = re.search(r"F\.?\s?I\.?\s?R\.?\s*(?:No\.?|#|number)?\s*[:\-]?\s*(\d{1,5}\s?/\s?\d{2,4})", t, re.I)
+    ps = re.search(r"(?:P\.?\s?S\.?|Police\s+Station|تھانہ)\s*[:\-]?\s*([A-Za-z][A-Za-z ]{2,28}|[\u0600-\u06FF ]{3,25})", t)
+    found, missing = dafa_lookup(items)
+    fno, fps, fd = (re.sub(r"\s", "", no.group(1)) if no else "not found"), (ps.group(1).strip() if ps else "not found"), (", ".join(sorted(dates)) or "none")
+    s = "FIR FACTS (read by code, exact - use them as written; if something is not listed here and not in the FIR text, do not invent it):\n"
+    s += f"- FIR no.: {fno}\n- Police station: {fps}\n- Dates found: {fd}\n"
+    s += "- Sections found: " + (", ".join((x['act'] + " " if x['act'] else "") + "S." + x['sec'] for x in items) or "none") + "\n"
+    s += "DAFA TABLE (verified by the admin team - the ONLY source you may use for punishment, bailable / non-bailable, cognizable, compoundable and court of trial):\n"
+    s += ("\n".join(_dafa_line(r) for r in found) if found else "(no rows)") + "\n"
+    s += ("Sections NOT in the table: " + ", ".join("S." + x['sec'] for x in missing) + " - for these write 'dafa table mein nahi - verify karein' and do NOT state punishment or bailability.\n") if missing else ""
+    return s
+# --- FACTS END
+
+
 class AiReq(BaseModel):
     kind: str                      # draft | research | citation | fir
     language: str = "English"
@@ -1404,6 +1639,7 @@ Prepare a complete, court-ready {g('category')} document: {g('doc_type')}
 - Reference (case / suit no., FIR no., law provisions): {g('ref') or blank}
 - Other details: {g('extra') or blank}
 - Facts & Grounds: {g('facts') or blank}{nofacts}{idnote}
+FACT RULE: every date, amount, number, name, address and place in the document must come from the details above. If one is not given, write a blank ________ instead of guessing. Do not state punishments or bailability from memory.
 Output only the finished document (no preface, notes or markdown symbols).""", f"Draft - {g('doc_type')}"
     if r.kind == "research":
         if not (g("section") or g("question")): raise HTTPException(400, "Section ya sawal likhein.")
@@ -1424,7 +1660,8 @@ Be explicit about anything you cannot confirm; do NOT invent details.""", "Citat
         if not (g("text") or r.image_b64 or r.images_b64): raise HTTPException(400, "FIR text ya photo dein.")
         return f"""{LP}
 Summarize and analyze this FIR for a Pakistani advocate: allegations, sections applied,
-weak points, bail grounds and next steps. Use a formal professional tone. End with one final line starting with 'Recommended draft:' naming the single most suitable petition or application to file now (for example pre-arrest bail, post-arrest bail, quashing of FIR).
+weak points, bail grounds and next steps. Use a formal professional tone. Use the FIR FACTS below exactly as written; take punishment, bailable / non-bailable, cognizable, compoundable and court of trial ONLY from the DAFA TABLE below, never from memory. End with one final line starting with 'Recommended draft:' naming the single most suitable petition or application to file now (for example pre-arrest bail, post-arrest bail, quashing of FIR).
+{fir_facts_prompt(g('text'))}
 FIR TEXT:
 {g('text')}""", "FIR Analysis"
     if r.kind == "category":
@@ -1433,8 +1670,8 @@ FIR TEXT:
         return f"""{LP}
 Topic: {CATEGORIES[cid]}
 List the sections of Pakistani law that are commonly applied in cases of this kind, so that an advocate can see at a glance which sections apply. Group them as: A) Pakistan Penal Code sections, B) special-law sections (if any), C) Code of Criminal Procedure (or other procedural) sections commonly used in such cases (for example FIR, arrest, bail, quashing), D) sections that are commonly added together (such as 34, 109, 148/149, 120-B) when relevant.
-For every section give one compact block in this form, without tables or markdown: 'Section <number> <Act> - <name of offence>: punishment; bailable or non-bailable; cognizable or non-cognizable; compoundable or not; court of trial'. Keep each block to one or two lines and order the sections logically (most serious first).
-Be accurate. If you are not sure about a detail (for example a punishment after an amendment) write 'verify' instead of guessing, and never invent section numbers. Finish with one line reminding the advocate to verify the current text on the official Pakistan Code website.""", f"Dafaat - {cid}"
+For every section give ONE line in this form, without tables or markdown: 'Section <number> <Act> - <name of offence>'. Do NOT state punishment, bailable / non-bailable, cognizable, compoundable or court of trial: the system adds those details from the admin-verified DAFA TABLE after your list. Order the sections logically (most serious first).
+Be accurate. If you are not sure that a section applies write 'verify' instead of guessing, and never invent section numbers. Finish with one line reminding the advocate to verify the current text on the official Pakistan Code website.""", f"Dafaat - {cid}"
     if r.kind == "section":
         law = g("law") or "all relevant Pakistani laws"
         if g("mode") == "topic":
@@ -1442,17 +1679,17 @@ Be accurate. If you are not sure about a detail (for example a punishment after 
             return f"""{LP}
 An advocate describes this offence or legal issue: {g('topic')}
 Search within: {law}
-Identify the most relevant sections or provisions of Pakistani law that apply: for each give the Act, the section number and a one-line explanation, ranked by relevance. For offences also state the punishment, whether it is bailable or non-bailable, cognizable or non-cognizable, compoundable, and the court of trial. Mention alternative or companion sections that are often invoked together, then add brief practical notes for the advocate.
+Identify the most relevant sections or provisions of Pakistani law that apply: for each give the Act, the section number and a one-line explanation, ranked by relevance. Do NOT state punishment, bailable / non-bailable, cognizable, compoundable or court of trial: the system adds them from the admin-verified DAFA TABLE after your answer. Mention alternative or companion sections that are often invoked together, then add brief practical notes for the advocate.
 Be explicit about anything you are not certain of and never invent section numbers.""", "Section search"
         if not g("section"): raise HTTPException(400, "Section number likhein.")
         q = ("Specific question: " + g("question")) if g("question") else ""
         return f"""{LP}
 Explain this provision of Pakistani law for an advocate. Law: {law}. Provision: {g('section')}. {q}
-Use these headings: 1) Name of the law and the section title; 2) Text or substance of the provision (if you cannot recall the exact wording, give the substance and say so); 3) Essential ingredients; 4) Punishment or relief, and for offences whether bailable or non-bailable, cognizable or non-cognizable, compoundable, and the court of trial; 5) Important amendments you know of; 6) Related and alternative sections; 7) Leading case law (ONLY from the VERIFIED AUTHORITIES supplied; if none, write 'none in verified database'); 8) Practical points for bail, quashing or defence.
+Use these headings: 1) Name of the law and the section title; 2) Text or substance of the provision (if you cannot recall the exact wording, give the substance and say so); 3) Essential ingredients; 4) Relief or consequence in general terms - do NOT state punishment, bailable / non-bailable, cognizable, compoundable or court of trial: the system adds them from the admin-verified DAFA TABLE; 5) Important amendments you know of; 6) Related and alternative sections; 7) Leading case law (ONLY from the VERIFIED AUTHORITIES supplied; if none, write 'none in verified database'); 8) Practical points for bail, quashing or defence.
 Statutes are amended often, so state clearly that the advocate must verify the current text on the official Pakistan Code website before relying on it. Never invent section numbers, text or citations.""", (f"Dafa - {g('section')} {g('law')}")[:80]
     raise HTTPException(400, "Unknown kind")
 
-def call_claude(content, progress=None, model=None, usage=None):
+def call_claude(content, progress=None, model=None, usage=None, system=None):
     """Streaming: a long draft keeps flowing instead of dying at the 110 s read timeout. Overall limit 420 s.
     First thinking off (fast), then the other way, then the older model. progress(n) gets the number of characters written so far."""
     client = anthropic.Anthropic(api_key=API_KEY, timeout=110.0, max_retries=0)
@@ -1466,7 +1703,7 @@ def call_claude(content, progress=None, model=None, usage=None):
                 raise last or RuntimeError("AI ko bohat der lag gayi")
             try:
                 n = 0
-                with client.messages.stream(model=m, max_tokens=max_tokens, system=SYSTEM, extra_body=extra,
+                with client.messages.stream(model=m, max_tokens=max_tokens, system=system or SYSTEM, extra_body=extra,
                                             messages=[{"role": "user", "content": content}]) as stream:
                     for piece in stream.text_stream:
                         n += len(piece)
@@ -1503,6 +1740,26 @@ def _note_usage(kind, model, tin, tout):
         traceback.print_exc()
 
 
+def finalize_text(r, text, uid, note=True):
+    """Everything the SERVER adds after the AI has answered: verified citations, Dafa-table details, the facts check.
+    Returns (text, citations, raw AI text, stats). The raw text is what gets cached (the table may change later)."""
+    raw, cites, stats, f = text, [], {"red": 0, "yellow": 0, "missing": 0}, (r.fields or {})
+    path = dpath(uid, "mycitations")
+    if r.kind in ("draft", "research", "section"):       # the AI only uses [A#] tags; the server prints the verified citations and their details
+        q = " ".join(v for v in f.values() if isinstance(v, str))[:600]
+        text, cites = cit.render(text, cit.authorities(q, path), path, q)
+    elif r.kind == "fir":                                # flag any citation that is not in the verified index
+        text, cites = cit.scrub(text, path)
+    if r.kind in ("fir", "section", "category"):         # punishment / bailable / cognizable ... only from the admin-verified table
+        extra = f" Section {f.get('section', '')} {f.get('law', '')}" if r.kind == "section" and f.get("section") else ""
+        text += dafa_block(raw + extra, note)
+    if r.kind in ("draft", "fir"):                       # dates, amounts and numbers must come from what the advocate supplied
+        has_img = bool(r.images_b64 or r.image_b64 or r.id_images_b64)
+        rep = guard_report(raw, " ".join(str(v) for v in f.values() if isinstance(v, str)), facts=not has_img)
+        text += guard_text(rep); stats = {k: rep[k] for k in ("red", "yellow", "missing")}
+    return text, cites, raw, stats
+
+
 def _run_job(jid, uid, r, content, label, lim, ckey):
     def prog(n):
         with JOBS_LOCK:
@@ -1512,16 +1769,11 @@ def _run_job(jid, uid, r, content, label, lim, ckey):
     except Exception as e:
         with JOBS_LOCK: JOBS[jid].update(status="error", code=502, detail=f"AI se jawab nahi aa saka ({type(e).__name__}): {str(e)[:220]}")
         return
-    cites = []
-    if r.kind in ("draft", "research", "section"):      # AI only uses [A#] tags; the server prints the verified citations and their details
-        q = " ".join(v for v in (r.fields or {}).values() if isinstance(v, str))[:600]
-        text, cites = cit.render(text, cit.authorities(q, dpath(uid, "mycitations")), dpath(uid, "mycitations"), q)
-    elif r.kind == "fir":                                # flag any citation that is not in the verified index
-        text, cites = cit.scrub(text, dpath(uid, "mycitations"))
+    text, cites, raw, _stats = finalize_text(r, text, uid)
     used = 0
     try:
         if r.kind == "category":
-            cache = rj(CAT_CACHE, {}); cache[ckey] = {"text": text, "ts": time.time()}; wj(CAT_CACHE, cache)
+            cache = rj(CAT_CACHE, {}); cache[ckey] = {"text": raw, "ts": time.time()}; wj(CAT_CACHE, cache)
         users = load_users(); u = users.get(uid)       # taaza load: dusri requests ke count overwrite na hon
         if u is not None:
             u["prompt_count"] = u.get("prompt_count", 0) + 1; used = u["prompt_count"]; wj(USERS_FILE, users)
@@ -1541,7 +1793,7 @@ def _run_job(jid, uid, r, content, label, lim, ckey):
 def ai(r: AiReq, authorization: str = Header(None)):
     users, uid = current(authorization); u = users[uid]
     lim = DAILY_LIMITS.get(u.get("package"))
-    ckey = f"{(r.fields or {}).get('category', '')}|{r.language}"
+    ckey = f"{(r.fields or {}).get('category', '')}|{r.language}|v2"
     if r.kind == "citation":      # verified-index lookup only: the AI is never asked if a case is real
         txt = (r.fields or {}).get("citation", "")
         if not txt.strip(): raise HTTPException(400, "Citation likhein.")
@@ -1552,7 +1804,7 @@ def ai(r: AiReq, authorization: str = Header(None)):
     if r.kind == "category":      # ek hi list sab ke liye: cache mein ho to free aur foran
         hit = rj(CAT_CACHE, {}).get(ckey)
         if hit and time.time() - hit.get("ts", 0) < 30 * 86400:
-            return {"result": hit["text"], "type": f"Sections - {ckey.split('|')[0]}", "used": u.get("prompt_count", 0), "limit": lim, "cached": True}
+            return {"result": hit["text"] + dafa_block(hit["text"]), "type": f"Sections - {ckey.split('|')[0]}", "used": u.get("prompt_count", 0), "limit": lim, "cached": True}
     if not u.get("is_admin") and lim is not None and u.get("prompt_count", 0) >= lim:
         raise HTTPException(429, f"Aaj ki limit ({lim} prompts) mukammal. Kal reset hogi ya package upgrade karein.")
     if not API_KEY: raise HTTPException(500, "AI service configure nahi hai.")
@@ -1632,7 +1884,7 @@ class Export(BaseModel): text: str; urdu: bool = False
 def export_docx(r: Export, authorization: str = Header(None)):
     current(authorization)
     d = docx.Document()
-    for line in r.text.split("\n"):
+    for line in r.text.split(CHECK_MARK.strip())[0].split("\n"):
         line = line.strip()
         if not line: continue
         p = d.add_paragraph()
@@ -1716,8 +1968,8 @@ def _clean_msgs(msgs):
     return out
 
 
-def _assist_call(base, key, model, system, msgs):
-    body = json.dumps({"model": model, "messages": [{"role": "system", "content": system}] + msgs, "max_tokens": 900, "temperature": 0.3}).encode()
+def _assist_call(base, key, model, system, msgs, max_tokens=900):
+    body = json.dumps({"model": model, "messages": [{"role": "system", "content": system}] + msgs, "max_tokens": max_tokens, "temperature": 0.3}).encode()
     req = urllib.request.Request(base + "/chat/completions", data=body, method="POST", headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=45) as resp: d = json.loads(resp.read().decode())
     return re.sub(r"<think>.*?</think>", "", str(d["choices"][0]["message"]["content"] or ""), flags=re.S).strip()
@@ -1730,7 +1982,7 @@ def assistant_chat(r: AssistIn, authorization: str = Header(None)):
     """Chat assistant on a FREE model (never Claude). Per-advocate daily limit, shared per-minute limit, PII removed, citations only from the verified library."""
     users, uid = current(authorization)
     prov = _assist_providers()
-    if not prov: raise HTTPException(503, "Law Assistant abhi setup nahi hua (admin Render mein ASSIST_API_KEY lagaye).")
+    if not prov: raise HTTPException(503, "Law Assistant abhi setup nahi hua (admin Render mein ASSIST_API_KEY lagaye)." if users[uid].get("is_admin") else "Law Assistant abhi chalu nahi hai. Admin se rabta karein.")
     msgs = _clean_msgs(r.messages)
     if not msgs or msgs[-1]["role"] != "user": raise HTTPException(400, "Pehle apna sawal likhein.")
     cap, today, adm = int(os.environ.get("ASSIST_DAILY", "30")), (datetime.utcnow() + timedelta(hours=5)).date().isoformat(), users[uid].get("is_admin")
@@ -1768,8 +2020,270 @@ def assistant_chat(r: AssistIn, authorization: str = Header(None)):
     return {"reply": text, "left": None if adm else max(0, cap - n - 1)}
 # --- ASSISTANT END
 
+# --- JUDGMENT BEGIN
+JUDG_DRAFTS, JUDG_JOBS, _JLOCK = {}, {}, threading.Lock()      # memory only (one server instance); drafts live one hour
+J_PROMPT = (
+    "You extract structured data from ONE Pakistani court judgment (its text follows). Reply with ONLY valid JSON - no markdown, no commentary.\n"
+    "Never invent anything that is not in the text. Do NOT write any law-report citation (PLD, SCMR, CLC, YLR, PCrLJ ...) unless it is printed in the text itself; "
+    "if it is, put it in printed_citation, otherwise leave it empty.\n"
+    'Keys: "case_ref" (e.g. "Civil Appeal No. 123 of 2020"), "printed_citation", "court", "bench" (judges exactly as printed), "decision_date" (YYYY-MM-DD, "" if not printed), '
+    '"title" (parties, e.g. "Ali v. The State"), "summary" (max 120 words, plain English: what was decided and why), "issues" (list, max 4), "holding" (1-3 sentences), '
+    '"statutes" (list of Act + section exactly as written in the text), "keywords" (list of English words a lawyer would search with), '
+    '"extracts" (list of up to 3 objects {"para": paragraph number as printed or "", "text": a VERBATIM quote copied character for character from the judgment, '
+    "1 to 4 sentences, at most 700 characters, the passage that states the legal principle}).\n")
+
+
+def _jnorm(s): return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def judgment_pages(pdf_bytes):
+    import pdfplumber
+    out = []
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for i, pg in enumerate(pdf.pages, 1):
+            t = pg.extract_text() or ""
+            if t.strip(): out.append((i, t))
+    return out
+
+
+def _jparse(raw):
+    s = str(raw or ""); a, b = s.find("{"), s.rfind("}")
+    if a < 0 or b <= a: raise ValueError("AI ne JSON nahi diya")
+    d = json.loads(s[a:b + 1])
+    txt = lambda k: str(d.get(k) or "").strip()[:2000]
+    lst = lambda k, n: [str(x).strip()[:300] for x in (d.get(k) or []) if str(x).strip()][:n] if isinstance(d.get(k), list) else []
+    ex = [{"para": str(e.get("para", ""))[:20], "text": str(e.get("text", "")).strip()} for e in (d.get("extracts") or []) if isinstance(e, dict) and str(e.get("text", "")).strip()][:3]
+    return {"case_ref": txt("case_ref")[:200], "printed_citation": txt("printed_citation")[:100], "court": txt("court")[:120], "bench": txt("bench")[:300],
+            "decision_date": txt("decision_date")[:10], "title": txt("title")[:300], "summary": txt("summary"), "issues": lst("issues", 4), "holding": txt("holding"),
+            "statutes": lst("statutes", 12), "keywords": lst("keywords", 15), "extracts": ex}
+
+
+def judgment_verify(d, plain):
+    """No AI here: what the model returned is compared with the judgment's own text. Quotes that are not in the text are removed."""
+    pn, checks = _jnorm(plain), []
+    chk = lambda field, ok, note: checks.append({"field": field, "ok": bool(ok), "note": note})
+    good = []
+    for e in d["extracts"]:
+        n = _jnorm(e["text"]); hit = len(n) >= 40 and n in pn
+        chk("ibarat", hit, ("faisle mein hu-ba-hu mili: " if hit else "AI ki likhi ibarat faisle mein nahi mili - hata di gayi: ") + e["text"][:70] + "...")
+        if hit: good.append({"para": e["para"], "text": e["text"][:700]})
+    d["extracts"] = good
+    nums = re.findall(r"\d+", d["case_ref"])
+    chk("case_ref", nums and all(n in plain for n in nums), "case number ke ankre faisle mein " + ("mile" if nums and all(n in plain for n in nums) else "nahi mile - check karein"))
+    yr = re.search(r"(?:19|20)\d{2}", d["decision_date"])
+    chk("decision_date", yr and yr.group(0) in plain, "tareekh ka saal faisle mein " + ("mila" if yr and yr.group(0) in plain else "nahi mila - check karein"))
+    chk("court", d["court"] and _jnorm(d["court"])[:10] in pn, "court ka naam faisle mein " + ("mila" if d["court"] and _jnorm(d["court"])[:10] in pn else "nahi mila - check karein"))
+    names = [x.strip() for x in re.split(r",|;| and ", d["bench"]) if len(x.strip()) > 3]
+    bad = [x for x in names if _jnorm(re.sub(r"(?i)\b(mr|mrs|ms|dr|justice|hon|ble|chief|sardar|syed)\b\.?", "", x)) not in pn]
+    chk("bench", names and not bad, "judges ke naam faisle mein " + ("mile" if names and not bad else "nahi mile: " + ", ".join(bad) if bad else "nahi likhe"))
+    sides = [s for s in re.split(r"\s+(?:v\.?|vs\.?|versus)\s+", d["title"], flags=re.I) if s.strip()]
+    chk("title", sides and all(_jnorm(s)[:12] in pn for s in sides), "parties ke naam faisle mein " + ("mile" if sides and all(_jnorm(s)[:12] in pn for s in sides) else "nahi mile - check karein"))
+    if d["printed_citation"] and _jnorm(d["printed_citation"]) not in pn:        # a law-report citation is accepted only if it is printed in the judgment itself
+        chk("citation", False, "AI ne '" + d["printed_citation"] + "' likha, lekin ye faisle mein chhapa hua nahi mila - hata diya")
+        d["printed_citation"] = ""
+    keep = [s for s in d["statutes"] if _jnorm(s) in pn]
+    if len(keep) != len(d["statutes"]): chk("statutes", False, f"{len(d['statutes']) - len(keep)} Act/section faisle mein nahi mile - hata diye")
+    d["statutes"] = keep
+    return d, checks
+
+
+def _judg_job(jid, text_ai, plain, uid):
+    try:
+        raw = call_claude(J_PROMPT + "\nJUDGMENT TEXT:\n" + text_ai, None, os.environ.get("MODEL_JUDGMENT") or "claude-sonnet-5-5",
+                          lambda m, i, o: _note_usage("judgment", m, i, o), system="You are a careful legal data-extraction tool. You only report what the document says.")
+        d, checks = judgment_verify(_jparse(raw), plain)
+        with _JLOCK:
+            JUDG_DRAFTS[jid] = {"text": plain, "ts": time.time()}
+            JUDG_JOBS[jid] = {"status": "done", "draft": d, "checks": checks, "draft_id": jid, "ts": time.time()}
+    except Exception as e:
+        traceback.print_exc()
+        with _JLOCK: JUDG_JOBS[jid] = {"status": "error", "error": str(e)[:200], "ts": time.time()}
+
+
+class JudgIn(BaseModel): pdf_b64: str
+class JobId(BaseModel): id: str
+
+@app.post("/admin/judgment/extract")
+def admin_judgment_extract(r: JudgIn, authorization: str = Header(None)):
+    """Admin only: official judgment PDF -> Claude Sonnet reads it -> every quote / name / number is checked against the PDF's own text. Nothing is saved yet."""
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    if len(r.pdf_b64) > 28_000_000: raise HTTPException(400, "PDF bohat bara hai (20 MB se kam rakhein).")
+    try:
+        import base64
+        pages = judgment_pages(base64.b64decode(r.pdf_b64))
+    except Exception:
+        raise HTTPException(400, "PDF nahi khul saka.")
+    if not pages: raise HTTPException(400, "Is PDF mein text nahi (scan ki hui tasveer hai). Text wali PDF dein.")
+    plain = "\n".join(t for _, t in pages)
+    if len(plain) > 200_000: raise HTTPException(400, "Faisla bohat bara hai (2 lakh huroof se zyada). Pehle zaroori hissa alag PDF mein karein.")
+    jid = secrets.token_hex(6)
+    with _JLOCK:
+        for k in [k for k, v in JUDG_DRAFTS.items() if time.time() - v["ts"] > 3600]: JUDG_DRAFTS.pop(k, None)
+        for k in [k for k, v in JUDG_JOBS.items() if time.time() - v.get("ts", 0) > 3600]: JUDG_JOBS.pop(k, None)
+        JUDG_JOBS[jid] = {"status": "pending", "ts": time.time()}
+    threading.Thread(target=_judg_job, args=(jid, "\n\n".join(f"[p.{i}]\n{t}" for i, t in pages), plain, uid), daemon=True).start()
+    return {"job": jid, "pages": len(pages), "chars": len(plain)}
+
+@app.post("/admin/judgment/job")
+def admin_judgment_job(r: JobId, authorization: str = Header(None)):
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    with _JLOCK: j = JUDG_JOBS.get(r.id)
+    if not j: raise HTTPException(404, "Ye kaam nahi mila (server dobara chala ho sakta hai). PDF dobara upload karein.")
+    return {k: v for k, v in j.items() if k != "ts"}
+# --- JUDGMENT END
+
+# --- HUB BEGIN
+HUB_FILE = {k: f"{DATA}/hub_{k}.json" for k in ("links", "thana", "calendar", "news")}
+HUB_COLS = {"links": ("section", "district", "title", "url", "note", "daily"), "thana": ("district", "thana", "court", "tehsil", "notes", "source"),
+            "calendar": ("start", "end", "title", "kind", "source"), "news": ("date", "title", "url", "source")}
+HUB_MAX = {"links": 400, "thana": 6000, "calendar": 400, "news": 300}
+HUB_SECTIONS = ("district", "highcourt", "bareact", "bar")
+HUB_SEED = [                                         # official sites that were checked; everything else is filled in by the admin
+    {"section": "highcourt", "district": "", "title": "Lahore High Court", "url": "https://lhc.gov.pk/", "note": "Cause list, judgments, rules, judges", "daily": ""},
+    {"section": "highcourt", "district": "", "title": "Supreme Court of Pakistan", "url": "https://www.supremecourt.gov.pk/", "note": "Cause lists and judgments", "daily": ""},
+    {"section": "highcourt", "district": "", "title": "Sindh High Court", "url": "https://sindhhighcourt.gov.pk/", "note": "Cause list, case search, judgments", "daily": ""},
+    {"section": "highcourt", "district": "", "title": "Balochistan High Court", "url": "https://bhc.gov.pk/", "note": "Cause list and judgments", "daily": ""},
+    {"section": "district", "district": "*", "title": "Punjab District Courts - Case Management System", "url": "https://dsj.punjab.gov.pk/", "note": "Date-wise cause list and case details of the district courts", "daily": "1"},
+    {"section": "bareact", "district": "", "title": "Pakistan Code (official laws database)", "url": "https://pakistancode.gov.pk/", "note": "Acts, Ordinances and Rules - Law & Justice Commission of Pakistan", "daily": ""}]
+_URL_OK = re.compile(r"^https?://[^\s/]+\.[^\s/]+", re.I)
+
+
+def hub_rows(kind):
+    rows = rj(HUB_FILE[kind], None)
+    if rows is None:
+        rows = [dict(x) for x in HUB_SEED] if kind == "links" else []
+        if rows: wj(HUB_FILE[kind], rows)
+    return rows
+
+
+def _hub_clean(kind, rec):
+    r = {k: str(rec.get(k) or "").strip()[:500 if k == "url" else 300] for k in HUB_COLS[kind]}
+    if kind == "links":
+        if r["section"] not in HUB_SECTIONS: return None, "section district / highcourt / bareact / bar mein se ho"
+        if not r["title"] or not _URL_OK.match(r["url"]): return None, "title aur sahi link (https://...) zaroori hain"
+        if r["section"] != "district": r["district"] = ""
+        elif r["district"] not in ("", "*"): r["district"] = r["district"].title()
+    elif kind == "thana":
+        if not (r["district"] and r["thana"] and r["court"]): return None, "district, thana aur court zaroori hain"
+        r["district"] = r["district"].title()
+    elif kind == "calendar":
+        try:
+            s = date.fromisoformat(r["start"]); e = date.fromisoformat(r["end"] or r["start"])
+        except ValueError: return None, "tareekh YYYY-MM-DD mein likhein"
+        if e < s or not r["title"]: return None, "end start se pehle nahi ho sakti aur title zaroori hai"
+        r["start"], r["end"] = s.isoformat(), e.isoformat(); r["kind"] = r["kind"].lower() if r["kind"].lower() in ("holiday", "vacation", "other") else "holiday"
+    else:
+        if not r["title"] or not _URL_OK.match(r["url"]): return None, "title aur sahi link (https://...) zaroori hain"
+        try: r["date"] = date.fromisoformat(r["date"]).isoformat() if r["date"] else date.today().isoformat()
+        except ValueError: return None, "tareekh YYYY-MM-DD mein likhein"
+    return r, ""
+
+
+def hub_import(kind, text):
+    import csv, io as _io
+    rows, added, skipped, errs = hub_rows(kind), 0, 0, []
+    for i, rec in enumerate(csv.DictReader(_io.StringIO(text or "")), 2):
+        r, why = _hub_clean(kind, rec)
+        if r is None: skipped += 1; errs.append(f"line {i}: {why}") if len(errs) < 5 else None; continue
+        if r in rows: skipped += 1; continue
+        if len(rows) >= HUB_MAX[kind]: skipped += 1; errs.append("hadd poori (fehrist full hai)") if len(errs) < 5 else None; continue
+        rows.append(r); added += 1
+    if added: wj(HUB_FILE[kind], rows)
+    return {"added": added, "skipped": skipped, "errors": errs, "total": len(rows)}
+
+
+_RSS = {}
+
+
+def _news_date(s):
+    s = str(s or "").strip()
+    try:
+        if re.match(r"\d{4}-\d{2}-\d{2}", s): return s[:10]
+        from email.utils import parsedate_to_datetime
+        return parsedate_to_datetime(s).date().isoformat()
+    except Exception: return date.today().isoformat()
+
+
+def _rss_items(url):
+    """Headlines + links only, from feeds the ADMIN listed in NEWS_FEEDS; cached for 30 minutes."""
+    c = _RSS.get(url)
+    if c and time.time() - c[0] < 1800: return c[1]
+    items = []
+    try:
+        import xml.etree.ElementTree as ET
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "AdvocateAI/1.0"}), timeout=8) as r: root = ET.fromstring(r.read(600_000))
+        atom = "{http://www.w3.org/2005/Atom}"
+        host = re.sub(r"^https?://(www\.)?", "", url).split("/")[0]
+        for it in (list(root.iter("item"))[:15] + list(root.iter(atom + "entry"))[:15]):
+            t = (it.findtext("title") or it.findtext(atom + "title") or "").strip()
+            link = (it.findtext("link") or "").strip()
+            if not link:
+                a = it.find(atom + "link"); link = (a.get("href") if a is not None else "") or ""
+            if t and _URL_OK.match(link): items.append({"date": _news_date(it.findtext("pubDate") or it.findtext(atom + "updated") or ""), "title": t[:200], "url": link, "source": host})
+    except Exception as e:
+        print("[news] feed failed:", url, type(e).__name__, flush=True)
+    _RSS[url] = (time.time(), items)
+    return items
+
+
+@app.get("/hub/links")
+def hub_links(district: str = "", authorization: str = Header(None)):
+    current(authorization)
+    d, rows = district.strip().title(), hub_rows("links")
+    pick = lambda sec: [{k: x.get(k, "") for k in ("title", "url", "note", "daily")} for x in rows if x["section"] == sec]
+    return {"districts": sorted(set(cs._URD.values())), "district_name": d,
+            "district": [{k: x.get(k, "") for k in ("title", "url", "note", "daily")} for x in rows if x["section"] == "district" and x.get("district", "") in ("", "*", d)],
+            "highcourt": pick("highcourt"), "bareact": pick("bareact"), "bar": pick("bar")}
+
+@app.get("/hub/news")
+def hub_news(authorization: str = Header(None)):
+    current(authorization)
+    items = list(hub_rows("news"))
+    for u in [x.strip() for x in os.environ.get("NEWS_FEEDS", "").split(",") if x.strip().startswith("http")][:6]: items += _rss_items(u)
+    items.sort(key=lambda x: x.get("date", ""), reverse=True)
+    return {"items": items[:60]}
+
+@app.get("/hub/calendar")
+def hub_calendar(authorization: str = Header(None)):
+    current(authorization)
+    since = (date.today() - timedelta(days=1)).isoformat()
+    return {"items": sorted((x for x in hub_rows("calendar") if x["end"] >= since), key=lambda x: x["start"])[:200]}
+
+@app.get("/hub/thana")
+def hub_thana(district: str = "", q: str = "", authorization: str = Header(None)):
+    current(authorization)
+    d, k = district.strip().lower(), q.strip().lower()
+    rows = [x for x in hub_rows("thana") if (not d or x["district"].lower() == d) and (not k or k in (x["thana"] + " " + x["court"] + " " + x["tehsil"]).lower())]
+    return {"items": rows[:60], "total": len(rows)}
+
+
+class HubIn(BaseModel): name: str; text: str = ""; index: int = -1
+
+@app.post("/admin/hub/import")
+def admin_hub_import(r: HubIn, authorization: str = Header(None)):
+    _admin_only(authorization)
+    if r.name not in HUB_COLS: raise HTTPException(400, "Qism sahi nahi.")
+    return hub_import(r.name, r.text)
+
+@app.post("/admin/hub/list")
+def admin_hub_list(r: HubIn, authorization: str = Header(None)):
+    _admin_only(authorization)
+    if r.name not in HUB_COLS: raise HTTPException(400, "Qism sahi nahi.")
+    return {"rows": hub_rows(r.name)[:400], "columns": list(HUB_COLS[r.name])}
+
+@app.post("/admin/hub/delete")
+def admin_hub_delete(r: HubIn, authorization: str = Header(None)):
+    _admin_only(authorization)
+    if r.name not in HUB_COLS: raise HTTPException(400, "Qism sahi nahi.")
+    rows = hub_rows(r.name)
+    if not 0 <= r.index < len(rows): raise HTTPException(404, "Ye entry nahi mili.")
+    rows.pop(r.index); wj(HUB_FILE[r.name], rows); return {"ok": True, "total": len(rows)}
+# --- HUB END
+
 class CitSearch(BaseModel): q: str
-class CitAdd(BaseModel): citation: str; title: str; source: str; court: str = ""; date: str = ""; bench: str = ""; summary: str = ""; keywords: str = ""; sections: str = ""; url: str = ""; extract: str = ""; para: str = ""; status: str = ""
+class CitAdd(BaseModel): citation: str; title: str; source: str; court: str = ""; date: str = ""; bench: str = ""; summary: str = ""; keywords: str = ""; sections: str = ""; url: str = ""; extract: str = ""; para: str = ""; status: str = ""; official: str = ""; draft_id: str = ""
 
 @app.post("/citations/search")
 def citations_search(r: CitSearch, authorization: str = Header(None)):
@@ -1782,7 +2296,14 @@ def citations_search(r: CitSearch, authorization: str = Header(None)):
 def admin_citations_add(r: CitAdd, authorization: str = Header(None)):
     users, uid = current(authorization)
     if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
-    ok, msg = cit.add_global(dict(r), users[uid].get("chamber_name", ""))
+    rec = dict(r); did = rec.pop("draft_id", "")
+    if did:                                              # filled from an AI-read judgment: the quote must still be in that judgment's own text
+        with _JLOCK: dr = JUDG_DRAFTS.get(did)
+        if not dr: raise HTTPException(410, "Ye draft khatam ho gaya (server dobara chala ya 1 ghanta guzar gaya). PDF dobara upload karein.")
+        ex = str(rec.get("extract", "")).strip()
+        if ex and _jnorm(ex) not in _jnorm(dr["text"]): raise HTTPException(400, "Ye ibarat faisle ke text mein hu-ba-hu nahi mili. Sirf faisle se copy ki hui ibarat dein.")
+        rec["official"], rec["ai_assisted"] = "1", "summary"
+    ok, msg = cit.add_global(rec, users[uid].get("chamber_name", ""))
     if not ok: raise HTTPException(400, msg)
     return {"ok": True}
 
@@ -2105,7 +2626,12 @@ def admin_library_todo(authorization: str = Header(None)):
     if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
     reqs, gaps, (cov, total), recheck = cit.requests_list(), cit.gaps_list(), cit.coverage(), cit.recheck_list()
     thin = [x for x in cov if x["entries"] < 5]
-    tasks = []
+    tasks, dreq, drows = [], dafa_requests(), len(dafa_rows())
+    if dreq: tasks.append({"priority": 0, "title": f"Dafa table mein {len(dreq)} dafaat ki tafseel nahi (lawyers ne FIR / dafa mein dekhe)",
+                           "how": "Har dafa ki saza, bailable, cognizable, compoundable aur court Pakistan Code website se dekh kar 'Dafa table' card mein add karein (zareya zaroor likhein). FIR tajziya aur dafaat ke jawab inhi se aate hain.",
+                           "items": [f"{x['act'] or '?'} {x['section']} - {x['count']} dafa" for x in dreq[:15]]})
+    if drows < 20: tasks.append({"priority": 0, "title": f"Dafa table mein abhi sirf {drows} dafaat hain", "how": "Pehle sab se aam dafaat bharein:",
+                                 "items": ["PPC: 302, 324, 337-A/F, 354, 365, 376, 379, 380, 392, 395, 406, 420, 489-F, 506", "CrPC: 22-A/B, 154, 161, 173, 265-K, 497, 498, 561-A", "CNSA 1997: 9"]})
     if reqs: tasks.append({"priority": 1, "title": f"Lawyers ne {len(reqs)} citation check kiye jo library mein nahi hain",
                            "how": "Har ek ko apni subscription ya court ki website par dekh kar 'Library mein add karein' se add karein (zareya zaroor likhein). Add hote hi darkhwast khud band ho jati hai.",
                            "items": [f"{r['citation']} - {r.get('count', 1)} dafa" for r in reqs[:15]]})
@@ -2117,7 +2643,95 @@ def admin_library_todo(authorization: str = Header(None)):
     if recheck: tasks.append({"priority": 4, "title": f"{len(recheck)} entries 'dobara check' ya 'distinguished' hain",
                               "how": "Un faislon ko dobara dekhein: ab bhi theek hain, ya overruled hue? Status update karein.", "items": [f"{x['citation']} - {x['status']}" for x in recheck[:15]]})
     tasks.append({"priority": 9, "title": "Roz ka mamool (10 minute)", "how": "1) Darkhwastein dekhein aur add karein. 2) 'Library kahan khali hai' dekhein. 3) Ek topic ki 2 se 3 nayi entries add karein.", "items": []})
+    for i, t in enumerate(tasks, 1): t["priority"] = i
     return {"library_entries": total, "tasks": tasks}
+
+# --- DAFA+AB BEGIN
+class DafaAdd(BaseModel): act: str; section: str; title: str; source: str; punishment: str = ""; bailable: str = ""; cognizable: str = ""; compoundable: str = ""; court: str = ""; notes: str = ""
+class TextIn(BaseModel): text: str
+
+
+def _admin_only(authorization):
+    users, uid = current(authorization)
+    if not users[uid].get("is_admin"): raise HTTPException(403, "Sirf admin.")
+    return users, uid
+
+@app.post("/admin/dafa/add")
+def admin_dafa_add(r: DafaAdd, authorization: str = Header(None)):
+    users, uid = _admin_only(authorization)
+    ok, msg = dafa_add(dict(r), users[uid].get("chamber_name", ""))
+    if not ok: raise HTTPException(400, msg)
+    return {"ok": True, "rows": len(dafa_rows())}
+
+@app.post("/admin/dafa/import")
+def admin_dafa_import(r: TextIn, authorization: str = Header(None)):
+    users, uid = _admin_only(authorization)
+    return {**dafa_import(r.text, users[uid].get("chamber_name", "")), "rows": len(dafa_rows())}
+
+@app.post("/admin/dafa/requests")
+def admin_dafa_requests(authorization: str = Header(None)):
+    _admin_only(authorization)
+    return {"requests": dafa_requests(), "rows": len(dafa_rows())}
+
+
+AB_JOBS = {}
+class AbIn(BaseModel): kind: str = "draft"; language: str = "English"; text: str = ""; doc_type: str = "Petition"; category: str = "Criminal"; models: list = ["free", "claude-haiku-5-5", "claude-sonnet-5-5"]
+
+
+def _ab_fields(a):
+    return ({"category": a.category, "doc_type": a.doc_type, "facts": a.text} if a.kind == "draft" else {"text": a.text} if a.kind == "fir"
+            else {"act": "Pakistani law", "question": a.text} if a.kind == "research" else {"mode": "topic", "topic": a.text})
+
+
+def _ab_job(jid, uid, a):
+    """The same question to the free AI, Haiku and Sonnet: same prompt, same server-side checks, so the numbers can be compared."""
+    try:
+        ar = AiReq(kind=a.kind, language=a.language, fields=_ab_fields(a))
+        prompt, label = build_prompt(ar, False)
+        if a.kind in ("draft", "research", "section"):
+            q = " ".join(v for v in ar.fields.values() if isinstance(v, str))[:600]
+            prompt = cit.authorities_block(q, dpath(uid, "mycitations")) + "\n\n" + prompt
+        out = []
+        for m in [str(x) for x in a.models][:4]:
+            if not (m == "free" or m.startswith("claude-")): continue
+            t0, use = time.time(), []
+            try:
+                if m == "free":
+                    prov = _assist_providers()
+                    if not prov: out.append({"model": "free", "error": "Free AI setup nahi hua (ASSIST_API_KEY)"}); continue
+                    base, key, model = prov[0]
+                    text, name = _assist_call(base, key, model, SYSTEM, [{"role": "user", "content": prompt}], 4000), "free: " + model
+                else:
+                    text, name = call_claude(prompt, None, m, lambda mm, i, o: (use.append((i, o)), _note_usage("abtest", mm, i, o))), m
+                final, _c, _raw, stats = finalize_text(ar, text, uid, note=False)
+                p = PRICES.get(m)
+                usd = round(sum(i for i, _ in use) / 1e6 * p[0] + sum(o for _, o in use) / 1e6 * p[1], 4) if (p and use) else (0.0 if m == "free" else None)
+                out.append({"model": name, "seconds": round(time.time() - t0, 1), "usd": usd, "red": stats["red"], "yellow": stats["yellow"], "missing": stats["missing"], "text": final})
+            except Exception as e:
+                out.append({"model": m, "error": f"{type(e).__name__}: {str(e)[:160]}"})
+        with _JLOCK: AB_JOBS[jid] = {"status": "done", "results": out, "label": label, "ts": time.time()}
+    except Exception as e:
+        traceback.print_exc()
+        with _JLOCK: AB_JOBS[jid] = {"status": "error", "error": str(getattr(e, "detail", e))[:200], "ts": time.time()}
+
+@app.post("/admin/abtest/start")
+def admin_abtest_start(r: AbIn, authorization: str = Header(None)):
+    users, uid = _admin_only(authorization)
+    if r.kind not in ("draft", "fir", "research", "section") or not r.text.strip(): raise HTTPException(400, "Qism chunein aur matan likhein.")
+    jid = secrets.token_hex(6)
+    with _JLOCK:
+        for k in [k for k, v in AB_JOBS.items() if time.time() - v.get("ts", 0) > 3600]: AB_JOBS.pop(k, None)
+        AB_JOBS[jid] = {"status": "pending", "ts": time.time()}
+    threading.Thread(target=_ab_job, args=(jid, uid, r), daemon=True).start()
+    return {"job": jid}
+
+@app.post("/admin/abtest/job")
+def admin_abtest_job(r: JobId, authorization: str = Header(None)):
+    _admin_only(authorization)
+    with _JLOCK: j = AB_JOBS.get(r.id)
+    if not j: raise HTTPException(404, "Ye kaam nahi mila (server dobara chala ho sakta hai).")
+    return {k: v for k, v in j.items() if k != "ts"}
+# --- DAFA+AB END
 
 @app.post("/admin/cases/of")
 def admin_cases_of(r: AdvId, authorization: str = Header(None)):
@@ -2227,11 +2841,47 @@ small{opacity:.75}
   <button onclick="usage()">Is mahine ka kharch dikhayein</button>
   <div id="us"></div>
 </div>
+<div class="card" id="s12" hidden>
+  <b>Court Hub data (admin)</b> <small>- links, thana-adalat, court calendar, legal news</small>
+  <select id="h1" onchange="hubHint()"><option value="links">Links (District Courts, High Court, Bare Acts, Bar)</option><option value="thana">Thana - Adalat</option><option value="calendar">Court calendar (chhutti)</option><option value="news">Legal news</option></select>
+  <textarea id="h2" rows="5" placeholder="" style="width:100%;box-sizing:border-box"></textarea>
+  <button onclick="hubImport()">CSV import (pehli line header ki ho)</button>
+  <button onclick="hubList()">Fehrist dekhein / hataein</button>
+  <div id="hl"></div>
+</div>
+<div class="card" id="s11" hidden>
+  <b>A/B test - teen model ek saath (admin)</b> <small>- Free AI, Haiku 5.5 aur Sonnet 5.5 par ek hi sawal; Claude walon ka kharch lagta hai</small>
+  <select id="ab1"><option value="draft">Draft</option><option value="fir">FIR tajziya</option><option value="research">Research</option><option value="section">Section / dafa</option></select>
+  <textarea id="ab2" rows="5" placeholder="Draft ke facts / FIR ka text / research ka sawal / jurm ka naam" style="width:100%;box-sizing:border-box"></textarea>
+  <input id="ab3" placeholder="Draft ki qism (jaise Post-arrest bail application) - sirf draft ke liye">
+  <button onclick="abStart()">Teeno par aazmayein</button>
+  <div id="abr"></div>
+</div>
+<div class="card" id="s10" hidden>
+  <b>Dafa Table (admin)</b> <small>- saza, bailable, cognizable wahi jo aap ne Pakistan Code se tasdeeq ki</small>
+  <input id="d1" placeholder="Act (PPC, CrPC, CNSA ...)"><input id="d2" placeholder="Section (jaise 302 ya 337-F(i))">
+  <input id="d3" placeholder="Dafa ka naam (jaise Qatl-e-amd)"><input id="d4" placeholder="Saza">
+  <input id="d5" placeholder="Bailable (Haan / Nahi)"><input id="d6" placeholder="Cognizable (Haan / Nahi)">
+  <input id="d7" placeholder="Compoundable"><input id="d8" placeholder="Court of trial">
+  <input id="d9" placeholder="Zareya - kahan se tasdeeq hua (zaroori)">
+  <button onclick="dafaAdd()">Table mein add karein</button>
+  <textarea id="d10" rows="3" placeholder="Bulk CSV: act,section,title,punishment,bailable,cognizable,compoundable,court,notes,source" style="width:100%;box-sizing:border-box"></textarea>
+  <button onclick="dafaImport()">Bulk import</button>
+  <button onclick="dafaReq()">Kin dafaat ki tafseel chahiye</button>
+  <div id="dr"></div>
+</div>
+<div class="card" id="s9" hidden>
+  <b>Official faisla - AI se nikalein</b> <small>- Supreme Court / High Court ka official PDF (text wali)</small>
+  <input id="jf" type="file" accept="application/pdf,.pdf">
+  <button onclick="judgExtract()">AI se nikalein (Claude Sonnet)</button>
+  <div id="jr"></div>
+</div>
 <div class="card" id="s6" hidden>
   <b>Verified Citation Library (admin)</b> <small>- sirf wahi citation jo aap ne khud tasdeeq kiya</small>
   <input id="c1" placeholder="Citation (jaise 2021 SCMR 1234)"><input id="c2" placeholder="Case ka title (parties)">
   <input id="c3" placeholder="Court"><input id="c4" placeholder="Faisle ki tareekh">
   <input id="c5" placeholder="Zareya - kahan se tasdeeq hua (zaroori)"><input id="c6" placeholder="Link (agar ho)">
+  <input id="c12" placeholder="Keywords (English, comma se)"><input id="c13" placeholder="Dafaat / Acts (jaise 497 CrPC)">
   <textarea id="c7" rows="3" placeholder="Khulasa (apne alfaz mein)" style="width:100%;box-sizing:border-box"></textarea>
   <textarea id="c9" rows="3" placeholder="Faisle se asal ibarat (hu-ba-hu, jo usool batati ho)" style="width:100%;box-sizing:border-box"></textarea>
   <input id="c10" placeholder="Para / page number">
@@ -2258,7 +2908,7 @@ small{opacity:.75}
 </div>
 <div class="card" id="out" hidden><pre id="msg"></pre><div id="sg"></div></div>
 <script>
-var T = null, LAST = null, CN = null;
+var T = null, LAST = null, CN = null, JDRAFT = '';
 function $(i){ return document.getElementById(i); }
 function show(t){ $('out').hidden = false; $('msg').textContent = t; }
 async function api(path, body){
@@ -2275,14 +2925,112 @@ async function login(){
     var d = await api('/auth/login', {identifier: $('id').value.trim(), password: $('pw').value});
     T = d.token; $('s1').hidden = true; $('s2').hidden = false;
     $('allw').hidden = !(d.user && d.user.is_admin);
-    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden; $('s4').hidden = false; $('s5').hidden = $('allw').hidden; $('s6').hidden = $('allw').hidden; $('s7').hidden = $('allw').hidden; $('s8').hidden = $('allw').hidden; if (!$('allw').hidden) alerts();
+    $('s3').hidden = $('allw').hidden; $('dryw').hidden = $('allw').hidden; $('s4').hidden = false; $('s5').hidden = $('allw').hidden; $('s6').hidden = $('allw').hidden; $('s7').hidden = $('allw').hidden; $('s8').hidden = $('allw').hidden; $('s9').hidden = $('allw').hidden; $('s10').hidden = $('allw').hidden; $('s11').hidden = $('allw').hidden; $('s12').hidden = $('allw').hidden; hubHint(); if (!$('allw').hidden) alerts();
     show('Login ho gaya. Ab PDF chunein.');
   } catch (e) { show(e.message); }
 }
+var HUB_HINT = {
+  links: 'section,district,title,url,note,daily\ndistrict,*,Naam,https://...,note,1     (section: district / highcourt / bareact / bar; district: * ya zile ka naam)',
+  thana: 'district,thana,court,tehsil,notes,source\nSialkot,Thana ka naam,Court ka naam,Tehsil,,Zareya',
+  calendar: 'start,end,title,kind,source\n2026-12-25,2026-12-25,Chhutti ka naam,holiday,Notification (kind: holiday / vacation / other)',
+  news: 'date,title,url,source\n2026-11-24,Khabar ki sarkhi,https://...,Akhbar ka naam'
+};
+function hubHint(){ $('h2').placeholder = HUB_HINT[$('h1').value]; }
+async function hubImport(){
+  try { var d = await api('/admin/hub/import', {name: $('h1').value, text: $('h2').value}); show('Add: ' + d.added + ', chhode: ' + d.skipped + '. Kul ' + d.total + (d.errors.length ? ' | ' + d.errors.join('; ') : '')); }
+  catch (e) { show(e.message); }
+}
+async function hubList(){
+  try {
+    var d = await api('/admin/hub/list', {name: $('h1').value}), box = $('hl'); box.textContent = '';
+    if (!d.rows.length) { box.textContent = 'Abhi koi entry nahi.'; return; }
+    d.rows.forEach(function(r, i){
+      var row = document.createElement('div'); row.style.cssText = 'margin-top:8px;font-size:13px';
+      row.appendChild(document.createTextNode(d.columns.map(function(c){ return r[c]; }).filter(Boolean).join(' | ') + '  '));
+      var b = document.createElement('button'); b.textContent = 'Hataein'; b.style.cssText = 'width:auto;padding:4px 10px';
+      b.onclick = async function(){ try { await api('/admin/hub/delete', {name: $('h1').value, index: i}); hubList(); } catch (e) { show(e.message); } };
+      row.appendChild(b); box.appendChild(row);
+    });
+  } catch (e) { show(e.message); }
+}
+async function dafaAdd(){
+  try {
+    var d = await api('/admin/dafa/add', {act: $('d1').value, section: $('d2').value, title: $('d3').value, punishment: $('d4').value, bailable: $('d5').value, cognizable: $('d6').value, compoundable: $('d7').value, court: $('d8').value, source: $('d9').value});
+    ['d2', 'd3', 'd4', 'd5', 'd6', 'd7', 'd8'].forEach(function(i){ $(i).value = ''; });
+    show('Table mein add ho gaya. Ab ' + d.rows + ' dafaat hain.');
+  } catch (e) { show(e.message); }
+}
+async function dafaImport(){
+  try { var d = await api('/admin/dafa/import', {text: $('d10').value}); show('Add: ' + d.added + ', chhode: ' + d.skipped + '. Ab ' + d.rows + ' dafaat hain.'); }
+  catch (e) { show(e.message); }
+}
+async function dafaReq(){
+  try {
+    var d = await api('/admin/dafa/requests', {}), box = $('dr'); box.textContent = 'Table mein abhi ' + d.rows + ' dafaat hain.';
+    if (!d.requests.length) { box.appendChild(document.createElement('br')); box.appendChild(document.createTextNode('Koi darkhwast nahi.')); return; }
+    d.requests.forEach(function(x){
+      var b = document.createElement('button'); b.textContent = (x.act || '?') + ' ' + x.section + '  (' + x.count + ' dafa)';
+      b.onclick = function(){ $('d1').value = x.act; $('d2').value = x.section; }; box.appendChild(b);
+    });
+  } catch (e) { show(e.message); }
+}
+async function abStart(){
+  try {
+    var s = await api('/admin/abtest/start', {kind: $('ab1').value, text: $('ab2').value, doc_type: $('ab3').value || 'Petition', language: 'English'}), box = $('abr');
+    box.textContent = 'Teeno model chal rahe hain... 1 se 3 minute intezar karein.';
+    for (var i = 0; i < 120; i++) {
+      await new Promise(function(r){ setTimeout(r, 3000); });
+      var j = await api('/admin/abtest/job', {id: s.job});
+      if (j.status === 'pending') continue;
+      if (j.status === 'error') throw new Error(j.error);
+      box.textContent = '';
+      j.results.forEach(function(x){
+        var h = document.createElement('div'); h.style.cssText = 'margin-top:14px;font-weight:700';
+        h.textContent = x.error ? (x.model + ' - ' + x.error) : (x.model + ' | ' + x.seconds + ' sec | ' + (x.usd === null ? 'qeemat maloom nahi' : '$' + x.usd) + ' | laal ' + x.red + ', peela ' + x.yellow + ', chhoota ' + x.missing);
+        box.appendChild(h);
+        if (x.text) { var p = document.createElement('pre'); p.style.cssText = 'white-space:pre-wrap;font-size:12px'; p.textContent = x.text; box.appendChild(p); }
+      });
+      return;
+    }
+    throw new Error('Bohat der lag gayi.');
+  } catch (e) { show(e.message); }
+}
+async function judgExtract(){
+  var f = $('jf').files[0]; if (!f) { show('Pehle faisle ka PDF chunein.'); return; }
+  try {
+    var s = await api('/admin/judgment/extract', {pdf_b64: b64(await f.arrayBuffer())}), box = $('jr');
+    box.textContent = 'AI faisla parh raha hai (' + s.pages + ' page). 1 se 2 minute intezar karein...';
+    for (var i = 0; i < 90; i++) {
+      await new Promise(function(r){ setTimeout(r, 2500); });
+      var j = await api('/admin/judgment/job', {id: s.job});
+      if (j.status === 'pending') continue;
+      if (j.status === 'error') throw new Error(j.error);
+      return judgFill(j);
+    }
+    throw new Error('Bohat der lag gayi. Dobara koshish karein.');
+  } catch (e) { show(e.message); }
+}
+function judgFill(j){
+  var d = j.draft, box = $('jr'); box.textContent = ''; JDRAFT = j.draft_id;
+  $('c1').value = d.printed_citation || (d.case_ref ? d.case_ref + (d.court ? ' (' + d.court + ')' : '') : '');
+  $('c2').value = d.title || ''; $('c3').value = d.court || ''; $('c4').value = d.decision_date || '';
+  $('c5').value = (d.court || 'Official') + ' - official faisla (AI se nikala, admin ne tasdeeq kiya)';
+  $('c7').value = d.summary || ''; var e0 = (d.extracts || [])[0] || {}; $('c9').value = e0.text || ''; $('c10').value = e0.para || '';
+  $('c12').value = (d.keywords || []).join(', '); $('c13').value = (d.statutes || []).join(', ');
+  var h = document.createElement('div'); h.style.fontWeight = '700'; h.textContent = 'AI ne nikala - ab har cheez khud dekhein. Neeche server ki jaanch:'; box.appendChild(h);
+  (j.checks || []).forEach(function(c){ var x = document.createElement('div'); x.style.color = c.ok ? '#2e7d32' : '#c62828'; x.textContent = (c.ok ? '✅ ' : '❌ ') + c.field + ': ' + c.note; box.appendChild(x); });
+  (d.extracts || []).slice(1).forEach(function(e, i){
+    var b = document.createElement('button'); b.textContent = 'Ibarat ' + (i + 2) + ' (para ' + (e.para || '?') + ') form mein lagayein';
+    b.onclick = function(){ $('c9').value = e.text; $('c10').value = e.para || ''; }; box.appendChild(b);
+  });
+  var n = document.createElement('div'); n.style.fontSize = '12px';
+  n.textContent = 'Ab neeche "Verified Citation Library" ka form dekhein (bhara hua hai), theek karein, status chunein, aur "Library mein add karein" dabayein. Citation mein agar PLD/SCMR ka hawala ho to wahan likh dein.';
+  box.appendChild(n);
+}
 async function citAdd(){
   try {
-    await api('/admin/citations/add', {citation: $('c1').value, title: $('c2').value, court: $('c3').value, date: $('c4').value, source: $('c5').value, url: $('c6').value, summary: $('c7').value, extract: $('c9').value, para: $('c10').value, status: $('c11').value});
-    ['c1', 'c2', 'c4', 'c6', 'c7', 'c9', 'c10'].forEach(function(i){ $(i).value = ''; }); $('c11').value = '';
+    await api('/admin/citations/add', {citation: $('c1').value, title: $('c2').value, court: $('c3').value, date: $('c4').value, source: $('c5').value, url: $('c6').value, summary: $('c7').value, extract: $('c9').value, para: $('c10').value, status: $('c11').value, keywords: $('c12').value, sections: $('c13').value, draft_id: JDRAFT});
+    ['c1', 'c2', 'c4', 'c6', 'c7', 'c9', 'c10', 'c12', 'c13'].forEach(function(i){ $(i).value = ''; }); $('c11').value = ''; JDRAFT = ''; $('jr').textContent = '';
     show('Library mein add ho gaya.');
   } catch (e) { show(e.message); }
 }
