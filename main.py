@@ -998,7 +998,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Advocate AI API", "version": "v35-court-hub", "model": MODEL, "data_dir": DATA, "storage": "upstash" if REMOTE else "disk"}
+    return {"status": "ok", "app": "Advocate AI API", "version": "v37-thana-courts", "model": MODEL, "data_dir": DATA, "storage": "upstash" if REMOTE else "disk"}
 
 # ---------------------------------------------------------------- helpers
 # --- STORE BEGIN
@@ -2136,8 +2136,8 @@ def admin_judgment_job(r: JobId, authorization: str = Header(None)):
 
 # --- HUB BEGIN
 HUB_FILE = {k: f"{DATA}/hub_{k}.json" for k in ("links", "thana", "calendar", "news")}
-HUB_COLS = {"links": ("section", "district", "title", "url", "note", "daily"), "thana": ("district", "thana", "court", "tehsil", "notes", "source"),
-            "calendar": ("start", "end", "title", "kind", "source"), "news": ("date", "title", "url", "source")}
+HUB_COLS = {"links": ("section", "district", "title", "url", "note", "daily"), "thana": ("district", "thana", "court", "tehsil", "notes", "source", "verified_on"),
+            "calendar": ("district", "start", "end", "title", "kind", "source"), "news": ("date", "title", "url", "source")}
 HUB_MAX = {"links": 400, "thana": 6000, "calendar": 400, "news": 300}
 HUB_SECTIONS = ("district", "highcourt", "bareact", "bar")
 HUB_SEED = [                                         # official sites that were checked; everything else is filled in by the admin
@@ -2166,9 +2166,12 @@ def _hub_clean(kind, rec):
         if r["section"] != "district": r["district"] = ""
         elif r["district"] not in ("", "*"): r["district"] = r["district"].title()
     elif kind == "thana":
-        if not (r["district"] and r["thana"] and r["court"]): return None, "district, thana aur court zaroori hain"
+        if not (r["district"] and r["thana"]): return None, "district aur thana zaroori hain"
         r["district"] = r["district"].title()
+        try: r["verified_on"] = date.fromisoformat(r["verified_on"]).isoformat() if r["verified_on"] else date.today().isoformat()
+        except ValueError: r["verified_on"] = date.today().isoformat()
     elif kind == "calendar":
+        r["district"] = "" if r["district"] in ("", "*") else r["district"].title()
         try:
             s = date.fromisoformat(r["start"]); e = date.fromisoformat(r["end"] or r["start"])
         except ValueError: return None, "tareekh YYYY-MM-DD mein likhein"
@@ -2187,6 +2190,12 @@ def hub_import(kind, text):
     for i, rec in enumerate(csv.DictReader(_io.StringIO(text or "")), 2):
         r, why = _hub_clean(kind, rec)
         if r is None: skipped += 1; errs.append(f"line {i}: {why}") if len(errs) < 5 else None; continue
+        if kind == "thana":
+            same = next((x for x in rows if x["district"] == r["district"] and x["thana"].lower() == r["thana"].lower() and (x["court"].lower() == r["court"].lower() or not x["court"])), None)
+            if same is not None:
+                if not same["court"] and r["court"]: same.update(r); added += 1
+                else: skipped += 1
+                continue
         if r in rows: skipped += 1; continue
         if len(rows) >= HUB_MAX[kind]: skipped += 1; errs.append("hadd poori (fehrist full hai)") if len(errs) < 5 else None; continue
         rows.append(r); added += 1
@@ -2246,17 +2255,20 @@ def hub_news(authorization: str = Header(None)):
     return {"items": items[:60]}
 
 @app.get("/hub/calendar")
-def hub_calendar(authorization: str = Header(None)):
+def hub_calendar(district: str = "", authorization: str = Header(None)):
     current(authorization)
-    since = (date.today() - timedelta(days=1)).isoformat()
-    return {"items": sorted((x for x in hub_rows("calendar") if x["end"] >= since), key=lambda x: x["start"])[:200]}
+    since, d = (date.today() - timedelta(days=1)).isoformat(), district.strip().title()
+    return {"items": sorted((x for x in hub_rows("calendar") if x["end"] >= since and (not d or x.get("district", "") in ("", d))), key=lambda x: x["start"])[:200]}
 
 @app.get("/hub/thana")
 def hub_thana(district: str = "", q: str = "", authorization: str = Header(None)):
     current(authorization)
     d, k = district.strip().lower(), q.strip().lower()
     rows = [x for x in hub_rows("thana") if (not d or x["district"].lower() == d) and (not k or k in (x["thana"] + " " + x["court"] + " " + x["tehsil"]).lower())]
-    return {"items": rows[:60], "total": len(rows)}
+    mn = int(os.environ.get("HUB_COMMUNITY_MIN", "2"))
+    comm = [{k: s.get(k, "") for k in ("district", "thana", "court", "tehsil", "votes")} for s in rj(HUB_SUG, [])
+            if (not d or s["district"].lower() == d) and (not k or k in (s["thana"] + " " + s["court"]).lower()) and s.get("votes", 1) >= mn]
+    return {"items": rows[:60], "total": len(rows), "community": comm[:30]}
 
 
 class HubIn(BaseModel): name: str; text: str = ""; index: int = -1
@@ -2281,6 +2293,139 @@ def admin_hub_delete(r: HubIn, authorization: str = Header(None)):
     if not 0 <= r.index < len(rows): raise HTTPException(404, "Ye entry nahi mili.")
     rows.pop(r.index); wj(HUB_FILE[r.name], rows); return {"ok": True, "total": len(rows)}
 # --- HUB END
+
+# --- HUB2 BEGIN
+HUB_SUG = f"{DATA}/hub_thana_suggest.json"
+HUBX_JOBS = {}
+_HUBX_PROMPT = {
+    "thana": ("From this official notification / list extract every police station together with the court that hears its cases. Reply with ONLY valid JSON: "
+              '{"rows": [{"district": "", "thana": "", "court": "", "tehsil": ""}]}. Copy every name EXACTLY as printed. Never add a row that is not in the text. Leave a value empty if the text does not say it.\n'),
+    "thana_names": ("From this official document (for example a police annual plan) extract the list of police stations of the district. Reply with ONLY valid JSON: "
+                    '{"rows": [{"thana": "", "tehsil": ""}]}. Copy every police station name EXACTLY as printed. Never add a name that is not in the text. Do not guess any court.\n'),
+    "calendar": ("From this official notification extract every court holiday or vacation. Reply with ONLY valid JSON: "
+                 '{"rows": [{"district": "", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD", "title": "", "kind": "holiday or vacation or other"}]}. Copy titles exactly as printed. '
+                 "Never add a row that is not in the text. If a holiday is a single day, end = start.\n")}
+
+
+def _hubx_job(jid, text_ai, plain, name, district):
+    """The AI reads the notification; the SERVER then checks every row against the PDF's own text and drops what is not there."""
+    import csv, io as _io
+    try:
+        raw = call_claude(_HUBX_PROMPT[name] + "\nDOCUMENT TEXT:\n" + text_ai, None, os.environ.get("MODEL_HUB") or "claude-sonnet-5-5",
+                          lambda m_, i, o: _note_usage("hubx", m_, i, o), system="You are a careful data-extraction tool. You only report what the document says.")
+        s = str(raw); a, b = s.find("{"), s.rfind("}")
+        rows = json.loads(s[a:b + 1]).get("rows", []) if a >= 0 and b > a else []
+        pn, good, dropped = _jnorm(plain), [], []
+        for r in [x for x in rows if isinstance(x, dict)][:800]:
+            if name == "thana_names":
+                t = str(r.get("thana", "")).strip(); why = "" if (len(_jnorm(t)) >= 3 and _jnorm(t) in pn) else "thane ka naam text mein nahi mila"
+                rec = {"district": district or str(r.get("district", "")), "thana": t, "court": "", "tehsil": str(r.get("tehsil", "")).strip(), "notes": "", "source": "Official document (AI se nikala, admin ne dekha)"}
+            elif name == "thana":
+                t, c = str(r.get("thana", "")).strip(), str(r.get("court", "")).strip()
+                why = "" if (len(_jnorm(t)) >= 3 and _jnorm(t) in pn) else "thane ka naam text mein nahi mila"
+                why = why or ("" if (len(_jnorm(c)) >= 6 and _jnorm(c) in pn) else "court ka naam text mein nahi mila")
+                rec = {"district": district or str(r.get("district", "")), "thana": t, "court": c, "tehsil": str(r.get("tehsil", "")).strip(), "notes": "", "source": "Notification PDF (AI se nikala, admin ne dekha)"}
+            else:
+                t = str(r.get("title", "")).strip(); why = ""
+                try:
+                    st = date.fromisoformat(str(r.get("start", ""))); en = date.fromisoformat(str(r.get("end") or r.get("start")))
+                    if not (len(_jnorm(t)) >= 4 and _jnorm(t)[:15] in pn): why = "title text mein nahi mila"
+                    elif str(st.year) not in plain or str(st.day) not in plain or str(en.day) not in plain: why = "tareekh ke ankre text mein nahi mile"
+                except ValueError: why = "tareekh sahi nahi"
+                rec = {"district": district or str(r.get("district", "")), "start": str(r.get("start", "")), "end": str(r.get("end") or r.get("start") or ""), "title": t, "kind": str(r.get("kind", "holiday")), "source": "Notification PDF (AI se nikala, admin ne dekha)"}
+            (dropped if why else good).append({"row": rec, "why": why} if why else rec)
+        cols = HUB_COLS["thana" if name == "thana_names" else name]; buf = _io.StringIO(); w = csv.writer(buf); w.writerow(cols)
+        for rec in good: w.writerow([rec.get(k, "") for k in cols])
+        with _JLOCK: HUBX_JOBS[jid] = {"status": "done", "csv": buf.getvalue(), "kept": len(good), "total": len(rows), "dropped": dropped[:30], "ts": time.time()}
+    except Exception as e:
+        traceback.print_exc()
+        with _JLOCK: HUBX_JOBS[jid] = {"status": "error", "error": str(e)[:200], "ts": time.time()}
+
+
+class HubXIn(BaseModel): pdf_b64: str; name: str = "thana"; district: str = ""
+
+@app.post("/admin/hub/extract")
+def admin_hub_extract(r: HubXIn, authorization: str = Header(None)):
+    """Admin only: official notification PDF -> rows (thana-adalat or court calendar). Nothing is saved: the admin reviews the CSV and imports it."""
+    _admin_only(authorization)
+    if r.name not in ("thana", "thana_names", "calendar"): raise HTTPException(400, "Sirf Thana ya Calendar chunein.")
+    if r.name != "calendar" and not r.district.strip(): raise HTTPException(400, "Thana ke liye zila chunein.")
+    if len(r.pdf_b64) > 28_000_000: raise HTTPException(400, "PDF bohat bara hai (20 MB se kam rakhein).")
+    try:
+        import base64
+        pages = judgment_pages(base64.b64decode(r.pdf_b64))
+    except Exception: raise HTTPException(400, "PDF nahi khul saka.")
+    if not pages: raise HTTPException(400, "Is PDF mein text nahi (scan ki hui tasveer hai). Text wali PDF dein.")
+    plain = "\n".join(t for _, t in pages)
+    if len(plain) > 200_000: raise HTTPException(400, "PDF bohat bara hai. Pehle zaroori hissa alag PDF mein karein.")
+    jid = secrets.token_hex(6)
+    with _JLOCK:
+        for k in [k for k, v in HUBX_JOBS.items() if time.time() - v.get("ts", 0) > 3600]: HUBX_JOBS.pop(k, None)
+        HUBX_JOBS[jid] = {"status": "pending", "ts": time.time()}
+    threading.Thread(target=_hubx_job, args=(jid, "\n\n".join(f"[p.{i}]\n{t}" for i, t in pages), plain, r.name, r.district.strip().title()), daemon=True).start()
+    return {"job": jid, "pages": len(pages)}
+
+@app.post("/admin/hub/extract/job")
+def admin_hub_extract_job(r: JobId, authorization: str = Header(None)):
+    _admin_only(authorization)
+    with _JLOCK: j = HUBX_JOBS.get(r.id)
+    if not j: raise HTTPException(404, "Ye kaam nahi mila (server dobara chala ho sakta hai).")
+    return {k: v for k, v in j.items() if k != "ts"}
+
+@app.post("/admin/hub/coverage")
+def admin_hub_coverage(authorization: str = Header(None)):
+    """Admin only: how much is filled for each of the 36 districts."""
+    _admin_only(authorization)
+    from collections import Counter
+    th, cal, lk = (Counter(x["district"] for x in hub_rows("thana")), Counter((x.get("district") or "*") for x in hub_rows("calendar")),
+                   Counter(x.get("district", "") for x in hub_rows("links") if x["section"] == "district"))
+    ds = sorted(set(cs._URD.values()))
+    nc = Counter(x["district"] for x in hub_rows("thana") if not x["court"])
+    return {"districts": [{"district": d, "thana": th.get(d, 0), "no_court": nc.get(d, 0), "calendar": cal.get(d, 0), "links": lk.get(d, 0)} for d in ds],
+            "calendar_all_punjab": cal.get("*", 0), "thana_total": sum(th.values()), "suggestions": len(rj(HUB_SUG, []))}
+
+
+class SugIn(BaseModel): district: str; thana: str; court: str; tehsil: str = ""; notes: str = ""
+
+@app.post("/hub/thana/suggest")
+def hub_thana_suggest(r: SugIn, authorization: str = Header(None)):
+    """Any advocate can tell which court hears a thana; it becomes public only after the admin approves it."""
+    users, uid = current(authorization)
+    rec, why = _hub_clean("thana", {"district": r.district, "thana": r.thana, "court": r.court, "tehsil": r.tehsil, "notes": r.notes, "source": "Advocate ne bataya, admin ne tasdeeq kiya"})
+    if rec is None: raise HTTPException(400, "Zila, thana aur court likhein.")
+    if not rec["court"]: raise HTTPException(400, "Court ka naam likhein.")
+    if any(x["district"] == rec["district"] and x["thana"].lower() == rec["thana"].lower() and x["court"] for x in hub_rows("thana")): return {"ok": True, "note": "Ye thana pehle se table mein hai."}
+    who, sug = _h(uid)[:10], rj(HUB_SUG, [])
+    for s in sug:
+        if s["district"] == rec["district"] and s["thana"].lower() == rec["thana"].lower() and s["court"].lower() == rec["court"].lower():
+            if who not in s["voters"]: s["voters"].append(who); s["votes"] = len(s["voters"])
+            wj(HUB_SUG, sug); return {"ok": True, "note": "Mashwara pehle se aaya hua hai - aap ki tasdeeq jud gayi. Admin dekhega."}
+    if len(sug) >= 600: raise HTTPException(429, "Abhi bohat mashware pending hain. Baad mein koshish karein.")
+    sug.append({**{k: rec[k] for k in ("district", "thana", "court", "tehsil", "notes")}, "voters": [who], "votes": 1, "date": date.today().isoformat()})
+    wj(HUB_SUG, sug); return {"ok": True, "note": "Admin ko bhej diya gaya. Tasdeeq ke baad sab ko nazar aayega."}
+
+@app.post("/admin/hub/suggestions")
+def admin_hub_suggestions(authorization: str = Header(None)):
+    _admin_only(authorization)
+    return {"items": sorted(rj(HUB_SUG, []), key=lambda s: -s.get("votes", 1))[:200]}
+
+class DecideIn(BaseModel): district: str; thana: str; court: str; approve: bool
+
+@app.post("/admin/hub/suggestion/decide")
+def admin_hub_decide(r: DecideIn, authorization: str = Header(None)):
+    _admin_only(authorization)
+    sug = rj(HUB_SUG, [])
+    hit = next((s for s in sug if s["district"] == r.district and s["thana"] == r.thana and s["court"] == r.court), None)
+    if not hit: raise HTTPException(404, "Ye mashwara nahi mila.")
+    if r.approve:
+        rec, why = _hub_clean("thana", {**{k: hit[k] for k in ("district", "thana", "court", "tehsil", "notes")}, "source": "Advocate ne bataya, admin ne tasdeeq kiya"})
+        rows = hub_rows("thana")
+        blank = next((x for x in rows if rec and x["district"] == rec["district"] and x["thana"].lower() == rec["thana"].lower() and not x["court"]), None)
+        if blank is not None: blank.update(rec); wj(HUB_FILE["thana"], rows)
+        elif rec and rec not in rows and len(rows) < HUB_MAX["thana"]: rows.append(rec); wj(HUB_FILE["thana"], rows)
+    sug.remove(hit); wj(HUB_SUG, sug)
+    return {"ok": True, "left": len(sug)}
+# --- HUB2 END
 
 class CitSearch(BaseModel): q: str
 class CitAdd(BaseModel): citation: str; title: str; source: str; court: str = ""; date: str = ""; bench: str = ""; summary: str = ""; keywords: str = ""; sections: str = ""; url: str = ""; extract: str = ""; para: str = ""; status: str = ""; official: str = ""; draft_id: str = ""
@@ -2847,6 +2992,12 @@ small{opacity:.75}
   <textarea id="h2" rows="5" placeholder="" style="width:100%;box-sizing:border-box"></textarea>
   <button onclick="hubImport()">CSV import (pehli line header ki ho)</button>
   <button onclick="hubList()">Fehrist dekhein / hataein</button>
+  <button onclick="hubCoverage()">36 zilon mein kitna bhara hai</button>
+  <button onclick="hubSug()">Advocates ke mashware (thana)</button>
+  <select id="hd"><option value="">Zila (PDF se nikalne ke liye)</option></select>
+  <input id="hf" type="file" accept="application/pdf,.pdf">
+  <label style="font-size:12px"><input id="hn" type="checkbox" style="width:auto;margin:0 6px"> Sirf thane ke naam (court nahi) - jaise zile ka Annual Policing Plan</label>
+  <button onclick="hubExtract()">PDF se nikalein (AI)</button>
   <div id="hl"></div>
 </div>
 <div class="card" id="s11" hidden>
@@ -2931,11 +3082,59 @@ async function login(){
 }
 var HUB_HINT = {
   links: 'section,district,title,url,note,daily\ndistrict,*,Naam,https://...,note,1     (section: district / highcourt / bareact / bar; district: * ya zile ka naam)',
-  thana: 'district,thana,court,tehsil,notes,source\nSialkot,Thana ka naam,Court ka naam,Tehsil,,Zareya',
-  calendar: 'start,end,title,kind,source\n2026-12-25,2026-12-25,Chhutti ka naam,holiday,Notification (kind: holiday / vacation / other)',
+  thana: 'district,thana,court,tehsil,notes,source\nSialkot,Thana ka naam,Court ka naam,Tehsil,,Zareya     (court khali chhod sakte hain - sirf naam bhi chalega)',
+  calendar: 'district,start,end,title,kind,source\n,2026-12-25,2026-12-25,Chhutti ka naam,holiday,Notification     (district khali = poore Punjab; kind: holiday / vacation / other)',
   news: 'date,title,url,source\n2026-11-24,Khabar ki sarkhi,https://...,Akhbar ka naam'
 };
 function hubHint(){ $('h2').placeholder = HUB_HINT[$('h1').value]; }
+async function hubCoverage(){
+  try {
+    var d = await api('/admin/hub/coverage', {}), box = $('hl'); box.textContent = '';
+    var sel = $('hd'); if (sel.options.length < 2) d.districts.forEach(function(x){ var o = document.createElement('option'); o.value = x.district; o.textContent = x.district; sel.appendChild(o); });
+    var h = document.createElement('div'); h.style.fontWeight = '700';
+    h.textContent = 'Thana-adalat kul ' + d.thana_total + ' | poore Punjab ki chhuttiyan ' + d.calendar_all_punjab + ' | pending mashware ' + d.suggestions; box.appendChild(h);
+    d.districts.forEach(function(x){
+      var r = document.createElement('div'); r.style.color = x.thana ? '#2e7d32' : '#c62828';
+      r.textContent = (x.thana ? '✅ ' : '❌ ') + x.district + ' - thana ' + x.thana + (x.no_court ? ' (court nahi: ' + x.no_court + ')' : '') + ', calendar ' + x.calendar + ', links ' + x.links; box.appendChild(r);
+    });
+  } catch (e) { show(e.message); }
+}
+async function hubExtract(){
+  var f = $('hf').files[0], nm = $('h1').value;
+  if (!f) { show('Pehle notification ka PDF chunein.'); return; }
+  if (nm !== 'thana' && nm !== 'calendar') { show('Upar "Thana - Adalat" ya "Court calendar" chunein.'); return; }
+  try {
+    var s = await api('/admin/hub/extract', {pdf_b64: b64(await f.arrayBuffer()), name: (nm === 'thana' && $('hn').checked) ? 'thana_names' : nm, district: $('hd').value}), box = $('hl');
+    box.textContent = 'AI notification parh raha hai (' + s.pages + ' page)... 1 se 2 minute.';
+    for (var i = 0; i < 90; i++) {
+      await new Promise(function(r){ setTimeout(r, 2500); });
+      var j = await api('/admin/hub/extract/job', {id: s.job});
+      if (j.status === 'pending') continue;
+      if (j.status === 'error') throw new Error(j.error);
+      $('h2').value = j.csv; box.textContent = '';
+      var h = document.createElement('div'); h.style.fontWeight = '700'; h.textContent = j.kept + ' / ' + j.total + ' rows text se mili hain aur upar box mein hain. Dekh kar theek karein, phir "CSV import" dabayein.'; box.appendChild(h);
+      j.dropped.forEach(function(x){ var d = document.createElement('div'); d.style.color = '#c62828'; d.textContent = '❌ hata di gayi (' + x.why + '): ' + JSON.stringify(x.row); box.appendChild(d); });
+      return;
+    }
+    throw new Error('Bohat der lag gayi.');
+  } catch (e) { show(e.message); }
+}
+async function hubSug(){
+  try {
+    var d = await api('/admin/hub/suggestions', {}), box = $('hl'); box.textContent = '';
+    if (!d.items.length) { box.textContent = 'Koi mashwara pending nahi.'; return; }
+    d.items.forEach(function(s){
+      var row = document.createElement('div'); row.style.cssText = 'margin-top:8px;font-size:13px';
+      row.appendChild(document.createTextNode(s.district + ' | ' + s.thana + ' -> ' + s.court + (s.tehsil ? ' | ' + s.tehsil : '') + '  (' + s.votes + ' advocate)  '));
+      [['Manzoor', true], ['Radd', false]].forEach(function(a){
+        var b = document.createElement('button'); b.textContent = a[0]; b.style.cssText = 'width:auto;padding:4px 10px;margin-left:4px';
+        b.onclick = async function(){ try { await api('/admin/hub/suggestion/decide', {district: s.district, thana: s.thana, court: s.court, approve: a[1]}); hubSug(); } catch (e) { show(e.message); } };
+        row.appendChild(b);
+      });
+      box.appendChild(row);
+    });
+  } catch (e) { show(e.message); }
+}
 async function hubImport(){
   try { var d = await api('/admin/hub/import', {name: $('h1').value, text: $('h2').value}); show('Add: ' + d.added + ', chhode: ' + d.skipped + '. Kul ' + d.total + (d.errors.length ? ' | ' + d.errors.join('; ') : '')); }
   catch (e) { show(e.message); }
